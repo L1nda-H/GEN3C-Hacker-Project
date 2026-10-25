@@ -53,6 +53,9 @@ For any other questions related to the model, please contact Xuanchi, Tianchang 
 ## Installation
 Please follow the "Inference" section in [INSTALL.md](INSTALL.md) to set up your environment.
 
+For development without a GPU, see [Laptop development and research workflow](docs/LAPTOP_SETUP.md).
+This CPU environment supports geometry experiments and analysis; full GEN3C inference requires the GPU setup above.
+
 ## Inference
 
 ### Download checkpoints
