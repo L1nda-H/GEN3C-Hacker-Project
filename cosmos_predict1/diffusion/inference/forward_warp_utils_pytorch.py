@@ -486,6 +486,135 @@ def project_points(world_points: torch.Tensor, w2c: torch.Tensor, intrinsic: tor
         return projected_points
 
 
+def _is_moving_against_neighbor(
+    depth_src: torch.Tensor,
+    w2c_src: torch.Tensor,
+    intrinsic_src: torch.Tensor,
+    depth_dst: torch.Tensor,
+    w2c_dst: torch.Tensor,
+    intrinsic_dst: torch.Tensor,
+    rel_thresh: float,
+) -> torch.Tensor:
+    """Return 1 where one neighbor shows that the source pixel moved.
+
+    The neighbor sample is the depth at the nearest pixel of the projected
+    world point. The pixel stays 0 when that landing is outside the neighbor,
+    when the neighbor depth there is invalid, or when the neighbor surface is
+    closer than the source point (the point is hidden, not moving).
+    """
+    frames, _, height, width = depth_src.shape
+    world_src = unproject_points(depth_src, w2c_src, intrinsic_src, is_depth=True)
+    projected = project_points(world_src, w2c_dst, intrinsic_dst)
+    z_dst = projected[..., 2, 0]
+    pixel_dst = projected[..., :2, 0] / z_dst.unsqueeze(-1).clamp_min(1e-8)
+
+    nearest_u = torch.round(pixel_dst[..., 0])
+    nearest_v = torch.round(pixel_dst[..., 1])
+    source_depth = depth_src[:, 0]
+    inside = (
+        (z_dst > 0)
+        & torch.isfinite(z_dst)
+        & torch.isfinite(pixel_dst).all(dim=-1)
+        & (nearest_u >= 0)
+        & (nearest_u <= width - 1)
+        & (nearest_v >= 0)
+        & (nearest_v <= height - 1)
+        & (source_depth > 0)
+        & torch.isfinite(source_depth)
+    )
+    u_idx = nearest_u.clamp(0, width - 1).long()
+    v_idx = nearest_v.clamp(0, height - 1).long()
+    batch_idx = torch.arange(frames, device=depth_src.device)[:, None, None]
+
+    neighbor_depth = depth_dst[:, 0][batch_idx, v_idx, u_idx]
+    observed = inside & (neighbor_depth > 0) & torch.isfinite(neighbor_depth)
+    # One-sided: the source point is in front of the neighbor surface. A nearer
+    # neighbor surface is an occluder, and that pixel was not observed to move.
+    forward_fail = (neighbor_depth - z_dst) / neighbor_depth.clamp_min(1e-8) > rel_thresh
+
+    world_dst = unproject_points(depth_dst, w2c_dst, intrinsic_dst, is_depth=True)
+    landed = world_dst[batch_idx, v_idx, u_idx]
+    projected_back = project_points(landed, w2c_src, intrinsic_src)
+    z_back = projected_back[..., 2, 0]
+    pixel_back = projected_back[..., :2, 0] / z_back.unsqueeze(-1).clamp_min(1e-8)
+    source_u = torch.arange(width, device=depth_src.device, dtype=depth_src.dtype).view(1, 1, width)
+    source_v = torch.arange(height, device=depth_src.device, dtype=depth_src.dtype).view(1, height, 1)
+    miss = (z_back <= 0) | ~torch.isfinite(z_back) | ~torch.isfinite(pixel_back).all(dim=-1)
+    miss = miss | ((pixel_back[..., 0] - source_u).square() + (pixel_back[..., 1] - source_v).square() > 1)
+    back_depth_fail = (z_back - source_depth).abs() / source_depth.clamp_min(1e-8) > rel_thresh
+    moving = observed & forward_fail & (miss | back_depth_fail)
+    return moving.to(dtype=depth_src.dtype)
+
+
+def motion_label(
+    depth: torch.Tensor,
+    w2c: torch.Tensor,
+    intrinsics: torch.Tensor,
+    rel_thresh: float,
+) -> torch.Tensor:
+    """Label pixels that fail a cross-frame depth check.
+
+    For pixel (u, v) in frame f, unproject a world point and project it into
+    frame f-1 and frame f+1. The first and last frames use their one neighbor.
+    The neighbor depth is the value stored at the nearest landed pixel.
+
+    The pixel is marked 1 when either in-bounds neighbor satisfies both checks:
+    the source point is closer than that neighbor surface,
+    ``(d_neighbor - z') / d_neighbor > rel_thresh``, and the neighbor pixel
+    unprojected and projected back misses (u, v) by more than one pixel or
+    fails ``|z_back - d_source| / d_source > rel_thresh``. A nearer neighbor
+    surface hides the point, so that pixel stays 0.
+
+    Args:
+        depth: (F, 1, H, W) depth maps, or (B, F, 1, H, W) independent sequences.
+        w2c: (F, 4, 4) or (B, F, 4, 4) world-to-camera matrices.
+        intrinsics: (F, 3, 3) or (B, F, 3, 3) camera intrinsics.
+        rel_thresh: relative depth change above which a check fails.
+
+    Returns:
+        Float tensor with the same shape as ``depth``. Pixels with no positive
+        depth, and pixels whose projections land outside every neighbor, stay 0.
+        A leading batch compares neighbors only inside each sequence.
+    """
+    single_sequence = depth.dim() == 4
+    if single_sequence:
+        depth = depth.unsqueeze(0)
+        w2c = w2c.unsqueeze(0)
+        intrinsics = intrinsics.unsqueeze(0)
+    if depth.dim() != 5 or depth.shape[2] != 1:
+        raise ValueError(
+            f"depth must have shape (F, 1, H, W) or (B, F, 1, H, W), got {tuple(depth.shape)}"
+        )
+    batch, frames, _, height, width = depth.shape
+    if w2c.shape != (batch, frames, 4, 4):
+        raise ValueError(f"w2c must have shape {(batch, frames, 4, 4)}, got {tuple(w2c.shape)}")
+    if intrinsics.shape != (batch, frames, 3, 3):
+        raise ValueError(
+            f"intrinsics must have shape {(batch, frames, 3, 3)}, got {tuple(intrinsics.shape)}"
+        )
+
+    label = torch.zeros_like(depth)
+    if frames < 2:
+        return label[0] if single_sequence else label
+
+    pairs = batch * (frames - 1)
+    src_depth = depth[:, :-1].reshape(pairs, 1, height, width)
+    dst_depth = depth[:, 1:].reshape(pairs, 1, height, width)
+    src_w2c = w2c[:, :-1].reshape(pairs, 4, 4)
+    dst_w2c = w2c[:, 1:].reshape(pairs, 4, 4)
+    src_intrinsics = intrinsics[:, :-1].reshape(pairs, 3, 3)
+    dst_intrinsics = intrinsics[:, 1:].reshape(pairs, 3, 3)
+    against_next = _is_moving_against_neighbor(
+        src_depth, src_w2c, src_intrinsics, dst_depth, dst_w2c, dst_intrinsics, rel_thresh
+    ).reshape(batch, frames - 1, height, width)
+    against_prev = _is_moving_against_neighbor(
+        dst_depth, dst_w2c, dst_intrinsics, src_depth, src_w2c, src_intrinsics, rel_thresh
+    ).reshape(batch, frames - 1, height, width)
+    label[:, :-1, 0] = torch.maximum(label[:, :-1, 0], against_next)
+    label[:, 1:, 0] = torch.maximum(label[:, 1:, 0], against_prev)
+    return label[0] if single_sequence else label
+
+
 def unproject_depth_torch(
     depth1: torch.Tensor,
     transformation1: torch.Tensor,

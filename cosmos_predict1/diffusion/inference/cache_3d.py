@@ -18,6 +18,7 @@ from einops import rearrange
 
 from cosmos_predict1.diffusion.inference.forward_warp_utils_pytorch import (
     forward_warp,
+    motion_label,
     reliable_depth_mask_range_batch,
     unproject_points,
 )
@@ -431,3 +432,132 @@ class Cache4D(Cache3D_Base):
     def render_cache(self, target_w2cs, target_intrinsics, render_depth=False, start_frame_idx=0):
         rendered_warp_images, rendered_warp_masks = super().render_cache(target_w2cs, target_intrinsics, render_depth, start_frame_idx)
         return rendered_warp_images, rendered_warp_masks
+
+
+class Cache3D_Labeled(Cache3D_Base):
+    """Full per-frame cloud plus an is-moving label on every point.
+
+    The frame axis is the ``F`` dimension of ``input_format``. Passing
+    ``(F, C, H, W)`` requires ``input_format=["F", "C", "H", "W"]``. The 5x5
+    depth filter stays off, so moving points are not removed.
+    """
+
+    def __init__(self, rel_thresh=0.05, **kwargs):
+        kwargs["filter_points_threshold"] = 1.0
+        kwargs["foreground_masking"] = False
+        input_w2c = kwargs["input_w2c"]
+        input_intrinsics = kwargs["input_intrinsics"]
+        super().__init__(**kwargs)
+        if self.input_depth is None:
+            raise ValueError("Cache3D_Labeled requires input_depth.")
+        self.rel_thresh = rel_thresh
+        self.motion_label = self._compute_motion_label(input_w2c, input_intrinsics)
+
+    def _compute_motion_label(self, input_w2c, input_intrinsics):
+        b, frames, n, v, _, height, width = self.input_image.shape
+        depth = rearrange(
+            self.input_depth.reshape(b, frames, n, v, height, width),
+            "b f n v h w -> (b n v) f 1 h w",
+        ).float()
+        w2c = rearrange(
+            input_w2c.reshape(b, frames, n, v, 4, 4),
+            "b f n v i j -> (b n v) f i j",
+        ).to(device=depth.device, dtype=torch.float32)
+        intrinsics = rearrange(
+            input_intrinsics.reshape(b, frames, n, v, 3, 3),
+            "b f n v i j -> (b n v) f i j",
+        ).to(device=depth.device, dtype=torch.float32)
+        labeled = motion_label(depth, w2c, intrinsics, self.rel_thresh)
+        return rearrange(labeled, "(b n v) f c h w -> b f n v c h w", b=b, n=n, v=v).to(
+            dtype=self.weight_dtype, device="cpu"
+        )
+
+    def update_cache(self, **kwargs):
+        raise NotImplementedError
+
+    def render_cache(self, target_w2cs, target_intrinsics, render_depth=False, start_frame_idx=0):
+        """Warp each source frame to its target camera.
+
+        Returns RGB, the coverage mask, and the splatted is-moving label.
+        Moving points are included. The label uses the same points and validity
+        mask as the color, so it lands on the same pixels.
+        """
+        if render_depth:
+            raise NotImplementedError("Cache3D_Labeled returns RGB, coverage, and the motion label.")
+        output_device = target_w2cs.device
+        batch, frame_count, buffers, views, channels, height, width = self.input_image.shape
+        if views != 1:
+            raise NotImplementedError
+        target_batch, target_frames, _, _ = target_w2cs.shape
+        if target_batch != batch:
+            raise ValueError(f"target batch {target_batch} does not match cache batch {batch}")
+        end_frame_idx = start_frame_idx + target_frames
+        if end_frame_idx > frame_count:
+            raise ValueError(
+                f"frames {start_frame_idx}:{end_frame_idx} exceed the cache length {frame_count}"
+            )
+
+        images = self.input_image[:, start_frame_idx:end_frame_idx, :, 0]
+        points = self.input_points[:, start_frame_idx:end_frame_idx, :, 0]
+        labels = self.motion_label[:, start_frame_idx:end_frame_idx, :, 0]
+        depth = self.input_depth.reshape(batch, frame_count, buffers, views, 1, height, width)
+        depth = depth[:, start_frame_idx:end_frame_idx, :, 0]
+        flat = batch * target_frames * buffers
+        images = images.reshape(flat, channels, height, width)
+        points = points.reshape(flat, height, width, 3)
+        labels = labels.reshape(flat, 1, height, width)
+        depth = depth.reshape(flat, 1, height, width)
+        cameras = (
+            target_w2cs.reshape(batch, target_frames, 1, 4, 4)
+            .expand(batch, target_frames, buffers, 4, 4)
+            .contiguous()
+            .reshape(flat, 4, 4)
+        )
+        intrinsics = (
+            target_intrinsics.reshape(batch, target_frames, 1, 3, 3)
+            .expand(batch, target_frames, buffers, 3, 3)
+            .contiguous()
+            .reshape(flat, 3, 3)
+        )
+
+        warped_images = []
+        warped_masks = []
+        warped_labels = []
+        chunk = 2
+        with torch.no_grad():
+            for start in range(0, flat, chunk):
+                stop = start + chunk
+                depth_chunk = depth[start:stop].to(self.device, dtype=self.weight_dtype)
+                valid = (torch.isfinite(depth_chunk) & (depth_chunk > 0)).to(self.weight_dtype)
+                cameras_chunk = cameras[start:stop].to(self.device, dtype=self.weight_dtype)
+                intrinsics_chunk = intrinsics[start:stop].to(self.device, dtype=self.weight_dtype)
+                points_chunk = points[start:stop].to(self.device, dtype=self.weight_dtype)
+                rgb, coverage, _, _ = forward_warp(
+                    images[start:stop].to(self.device, dtype=self.weight_dtype),
+                    mask1=valid,
+                    depth1=None,
+                    transformation1=None,
+                    transformation2=cameras_chunk,
+                    intrinsic1=intrinsics_chunk,
+                    intrinsic2=intrinsics_chunk,
+                    is_image=True,
+                    world_points1=points_chunk,
+                )
+                splatted_label, _, _, _ = forward_warp(
+                    labels[start:stop].to(self.device, dtype=self.weight_dtype),
+                    mask1=valid,
+                    depth1=None,
+                    transformation1=None,
+                    transformation2=cameras_chunk,
+                    intrinsic1=intrinsics_chunk,
+                    intrinsic2=intrinsics_chunk,
+                    is_image=False,
+                    world_points1=points_chunk,
+                )
+                warped_images.append(rgb.to(output_device))
+                warped_masks.append(coverage.to(output_device))
+                warped_labels.append(splatted_label.to(output_device))
+        rgb = torch.cat(warped_images, dim=0).reshape(batch, target_frames, buffers, channels, height, width)
+        coverage = torch.cat(warped_masks, dim=0).reshape(batch, target_frames, buffers, 1, height, width)
+        splatted_label = torch.cat(warped_labels, dim=0).reshape(batch, target_frames, buffers, 1, height, width)
+        return rgb, coverage, splatted_label
