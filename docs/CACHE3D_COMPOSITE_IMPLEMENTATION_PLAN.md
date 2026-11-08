@@ -36,7 +36,22 @@ Requirements:
 - Reuse `Cache3D_Base.__init__()` for tensor dimension normalization, storage, depth sanitization, and existing depth-reliability filtering; reuse `_compute_input_points()` / `unproject_points()` for geometry. Extend label handling in step 6 rather than duplicating these cache operations in `prepare_source()`.
 
 ### 2. Segment instances
-Implement a `SegmenterAdapter.segment()` interface around a promptable instance segmenter; begin with box/point prompts and support automatic proposals through the same interface. Segment candidate objects before final scene selection. Resolve duplicate/nested proposals, retain uncertain boundaries, and compute an appearance embedding from each masked RGB region.
+
+Current status:
+
+- **Pending:** segmentation adapters, proposal cleanup, and appearance extraction are not implemented.
+- Reuse `PreparedSource.observations` from `prepare_source()`; segmentation consumes prepared RGB and preserves its `(frame_idx, view_id)` keys and geometry masks.
+
+Requirements:
+
+- Implement `segment_source()` in `instance_segmentation.py` to process each prepared observation and return its instance records, ambiguous-pixel mask, and unassigned-pixel mask. Preserve observation keys even when no instances are found; do not change cameras, image size, or cache packing.
+- Define `SegmenterAdapter.segment()` around a promptable instance segmenter. Start with box/point prompts keyed by observation and expressed in prepared-image coordinates; allow automatic proposals through the same output contract. Explicitly convert the supplied RGB range/layout to the backend's expected input and map predicted masks back to the prepared `[H, W]` grid.
+- Return one `InstanceObservation` per candidate: a unique observation-local ID, boolean mask, segmentation confidence, and appearance embedding. Validate mask shape and nonempty area; expose configurable quality thresholds. Class names are optional metadata, not instance identity. Discover candidate objects before the composite's final object selection.
+- Add `clean_instance_proposals()` to suppress repeated proposals for the same object using mask overlap and confidence. Preserve distinct contained objects; do not suppress a candidate solely because it lies inside another mask. Mark unresolved overlaps/boundaries as ambiguous rather than assigning an arbitrary owner.
+- Add `AppearanceEncoderAdapter.encode()` to compute comparable, normalized embeddings from masked RGB crops using one encoder across the source. Exclude surrounding background from the object representation. These features support later association when geometric overlap is limited; they do not establish identity by themselves.
+- Keep segmentation masks independent of `geometry_mask`: missing depth must not erase an RGB object candidate. Use geometry validity when matching/unprojecting later. Retain unassigned and ambiguous regions for step 5 to distinguish environment from unknown; do not assign every unclaimed pixel to environment here.
+- Keep IDs local to each observation at this stage. Cross-view association belongs to step 3, temporal identity to step 4, and canonical `(source_id, instance_id)` assignment to step 5. A future tracker may populate optional `track_id`; segmentation alone must not claim consistent identity across views or frames.
+- Verify the contract with a fake backend: observation-key preservation, backend mask remapping, two same-class instances, duplicate proposals, distinct contained objects, overlap uncertainty, empty results, and object masks spanning invalid depth. Inspect real-backend mask overlays on prepared RGB before using them for association.
 
 ```python
 @dataclass
@@ -50,7 +65,7 @@ class InstanceObservation:
     track_id: int | None = None
 ```
 
-Keep class names as optional metadata; two objects with the same name remain separate instances. Video trackers supply temporary track IDs, not final source-wide IDs.
+`segment_source()` groups these records by observation; ambiguity and unassigned masks are separate per-image outputs. Final point labels are produced in step 5 and attached in step 6.
 
 ### 3. Match views geometrically
 In `instance_association.py`, implement `visible_correspondences()` using existing `unproject_points()` and `project_points()` from `forward_warp_utils_pytorch.py`. Use valid, in-bounds points whose projected depth agrees with destination depth. Project in both directions; compare masks only on mutually observed surfaces, so unseen portions do not count as mismatches.
