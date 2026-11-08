@@ -13,16 +13,27 @@
 
 3. **Build the composite.** Add `cache3d_composite.py` containing `Cache3D_Composite`: `add_source()`, `set_selection()`, `set_transform()`, `set_time_mapping()`, and `render_cache()`. Store child caches by source ID, object metadata, source/object placement transforms, and dynamic time mappings. Place selected geometry in one destination coordinate system, including explicit scale calibration; repeat static sources across requested times.
 
-4. **Select, render, and fuse.** For each target frame: resolve source time → apply selected-ID and validity masks → transform selected points → obtain per-source RGB, depth, and coverage → resolve visibility across all sources → fuse compatible observations. Separate user object selection from fusion's choice of source observations. Start with nearest-surface visibility and confidence-weighted blending only among observations of the same surface; leave uncovered pixels for GEN3C. Never interpolate numeric instance IDs. Extend `forward_warp_utils_pytorch.py` only where categorical projection or shared visibility requires it. In `Cache3D_BufferSelector.render_cache()`, rank after selection and prevent its near-full-view shortcut from suppressing selected objects.
-
-5. **Connect and verify.** Wire labeled source loading into `gen3c_multiview.demo()` and construct the composite there; retain the generation pipeline's RGB/coverage tensor contract. Feature-level fusion, if chosen later, belongs in the model conditioning path. Before enabling generated-frame cache updates, associate new labels and retain geometry in the correct coordinate frame. Check cross-view/frame ID consistency, selected-only rendering, cross-source occlusion, and static/dynamic time alignment. First milestone: one manually placed static object from one source inside another source's environment.
-
 ## Step 1: segmentation, matching, and labeling
 
-The snippets are implementation sketches; adapter interfaces and association helpers described here are new, not existing GEN3C APIs.
+Status: input alignment is complete; segmentation, association, tracking, persistence, and label attachment remain pending. Remaining snippets are implementation sketches.
 
 ### 1. Align inputs
-In `instance_segmentation.py`, implement `prepare_source()`: index RGB, depth, intrinsics, and world-to-camera poses by `(frame_idx, view_id)`. Apply the same crop/resize to images and masks, update intrinsics, and resize existing labels with nearest-neighbor interpolation. Record validity before depth sanitization. Geometry matching requires a consistent coordinate system/scale within each source and camera-Z depth; convert ray-distance depth when necessary.
+
+Current status:
+
+- **Complete:** `prepare_source()` preserves `(frame_idx, view_id)` observations and packs frame/view inputs for existing child caches.
+- Validates alignment and OpenCV cameras; applies crop/resize with updated intrinsics and integer-safe half-pixel nearest sampling for depth, masks, and labels.
+- Preserves geometry validity as `input_mask` and converts ray distance to camera-Z using existing unprojection. Callers ensure synchronization and consistent source coordinates/units.
+- **Verified:** 8 CPU tests pass, including noninteger resize regressions and cache geometry checks. Segmentation and cache label attachment are next-stage work.
+
+Requirements:
+
+- Implement `prepare_source()` in `instance_segmentation.py` as a thin preprocessing adapter for one source: a single image, video, static multiview set, or synchronized multiview videos.
+- Index each observation's RGB, depth, intrinsics, world-to-camera pose, and optional masks/labels by `(frame_idx, view_id)`; preserve this mapping through segmentation and cache construction.
+- Validate pixel alignment and camera conventions. If cropping/resizing is needed, apply matching spatial transforms to RGB, depth, masks, and labels; update intrinsics and use nearest-neighbor interpolation for categorical labels and validity masks. Accept already aligned inputs directly.
+- Preserve finite, positive depth validity, combined with any supplied geometry mask, before resizing or the cache's depth sanitization. Keep validity separate from instance labels and pass it as `input_mask` at cache construction.
+- Require consistent coordinates and scale within the source. Reuse `unproject_points(..., is_depth=...)` for camera-Z or ray-distance input; ensure depth used for association is camera-Z, converting ray-distance values when necessary. Cross-source placement and scale calibration belong to the composite stage.
+- Reuse `Cache3D_Base.__init__()` for tensor dimension normalization, storage, depth sanitization, and existing depth-reliability filtering; reuse `_compute_input_points()` / `unproject_points()` for geometry. Extend label handling in step 6 rather than duplicating these cache operations in `prepare_source()`.
 
 ### 2. Segment instances
 Implement a `SegmenterAdapter.segment()` interface around a promptable instance segmenter; begin with box/point prompts and support automatic proposals through the same interface. Segment candidate objects before final scene selection. Resolve duplicate/nested proposals, retain uncertain boundaries, and compute an appearance embedding from each masked RGB region.
