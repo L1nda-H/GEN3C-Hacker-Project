@@ -15,7 +15,7 @@
 
 ## Step 1: segmentation, matching, and labeling
 
-Status: input alignment is complete; segmentation, association, tracking, persistence, and label attachment remain pending. Remaining snippets are implementation sketches.
+Status: input alignment and the backend-independent segmentation contract are complete; real-backend overlay validation, association, tracking, persistence, and label attachment remain pending. Remaining snippets are implementation sketches.
 
 ### 1. Align inputs
 
@@ -39,7 +39,8 @@ Requirements:
 
 Current status:
 
-- **Pending:** segmentation adapters, proposal cleanup, and appearance extraction are not implemented.
+- **Complete:** injectable segmentation/appearance adapters, proposal cleanup, and per-observation instance, ambiguity, unassigned, and confirmed-environment outputs in `instance_segmentation.py`.
+- **Verified:** 23 CPU tests cover alignment/cache geometry and fake-backend segmentation contracts. Real model wrappers/checkpoints and inspection of their mask overlays remain pending before association.
 - Reuse `PreparedSource.observations` from `prepare_source()`; segmentation consumes prepared RGB and preserves its `(frame_idx, view_id)` keys and geometry masks.
 
 Requirements:
@@ -50,6 +51,7 @@ Requirements:
 - Add `clean_instance_proposals()` to suppress repeated proposals for the same object using mask overlap and confidence. Preserve distinct contained objects; do not suppress a candidate solely because it lies inside another mask. Mark unresolved overlaps/boundaries as ambiguous rather than assigning an arbitrary owner.
 - Add `AppearanceEncoderAdapter.encode()` to compute comparable, normalized embeddings from masked RGB crops using one encoder across the source. Exclude surrounding background from the object representation. These features support later association when geometric overlap is limited; they do not establish identity by themselves.
 - Keep segmentation masks independent of `geometry_mask`: missing depth must not erase an RGB object candidate. Use geometry validity when matching/unprojecting later. Retain unassigned and ambiguous regions for step 5 to distinguish environment from unknown; do not assign every unclaimed pixel to environment here.
+- Retain an explicit environment mask from segmentation or user confirmation. In step 5, assign environment label `0` only to confirmed, valid, unambiguous environment pixels; unassigned pixels remain unknown (`-1`) until resolved.
 - Keep IDs local to each observation at this stage. Cross-view association belongs to step 3, temporal identity to step 4, and canonical `(source_id, instance_id)` assignment to step 5. A future tracker may populate optional `track_id`; segmentation alone must not claim consistent identity across views or frames.
 - Verify the contract with a fake backend: observation-key preservation, backend mask remapping, two same-class instances, duplicate proposals, distinct contained objects, overlap uncertainty, empty results, and object masks spanning invalid depth. Inspect real-backend mask overlays on prepared RGB before using them for association.
 
@@ -66,6 +68,41 @@ class InstanceObservation:
 ```
 
 `segment_source()` groups these records by observation; ambiguity and unassigned masks are separate per-image outputs. Final point labels are produced in step 5 and attached in step 6.
+
+Adapter usage (model loading stays with the caller):
+
+```python
+from cosmos_predict1.diffusion.inference.instance_segmentation import (
+    AppearanceEncoderAdapter, SegmenterAdapter, SegmentPrompts, segment_source,
+)
+
+# segment_backend(image, prompts) returns SegmentPrediction with full-input-grid
+# InstanceProposal masks and optional explicitly confirmed environment_mask.
+# appearance_backend(masked_crop, crop_mask) returns a nonzero floating vector;
+# it must honor crop_mask when preprocessing/pooling the object representation.
+segmenter = SegmenterAdapter(
+    segment_backend, input_layout="HWC", input_range="uint8", input_size=None,
+)
+encoder = AppearanceEncoderAdapter(appearance_backend, input_layout="CHW", input_range="0_1")
+segmented = segment_source(
+    prepared, segmenter, encoder, rgb_range=(-1, 1),  # Actual prepared RGB range.
+    prompts={(frame_idx, view_id): SegmentPrompts(boxes=boxes_xyxy)},
+    environment_masks=confirmed_environment_masks,  # Optional keyed bool [H,W].
+    min_confidence=0.5, min_area=16, boundary_width=1,
+)
+image_result = segmented.observations[frame_idx, view_id]
+```
+
+Omit prompts for automatic proposals. Boxes/points use prepared-image integer
+pixel centers; the adapter scales them with its optional image resize. Backend
+wrappers must undo internal padding/cropping and convert logits to probabilities
+before returning masks. Local IDs restart per observation and do not imply
+cross-image identity. Candidate masks keep overlaps; downstream rasterization
+must exclude `ambiguous_mask`. `environment_mask` is confirmed RGB evidence;
+step 5 must intersect geometry validity before assigning label `0`.
+
+Run the CPU contract suite with
+`python -m unittest discover -s tests -p 'test_*seg*.py' -v`.
 
 ### 3. Match views geometrically
 In `instance_association.py`, implement `visible_correspondences()` using existing `unproject_points()` and `project_points()` from `forward_warp_utils_pytorch.py`. Use valid, in-bounds points whose projected depth agrees with destination depth. Project in both directions; compare masks only on mutually observed surfaces, so unseen portions do not count as mismatches.
