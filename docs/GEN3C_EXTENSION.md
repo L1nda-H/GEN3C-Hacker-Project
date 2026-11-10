@@ -3,6 +3,7 @@
 ## Project overview
 
 - Extend GEN3C to generate videos combining selected objects from different source scenes.
+- MVP: single-view images and single-camera clips. Temporarily defer geometric multiview association (step 3 of the detailed plan); retain its requirements for later support. Still images bypass video propagation, while clips use SAM 2.1 tracking before labeling.
 
 ## Inputs and outputs
 

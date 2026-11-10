@@ -8,7 +8,7 @@
 - Expose the existing `render_cache()` camera interface, with explicit object selections and a replaceable fusion policy.
 
 ## Implementation steps
-1. **Segment, match, and label inputs.** Use `SAM21Segmenter` in `instance_segmentation.py` and add `instance_association.py` under `cosmos_predict1/diffusion/inference/`. Produce reusable integer label maps and a per-source object registry before constructing child caches. For videos, propagate SAM masks before final cross-view association and labeling.
+1. **Segment and label single-camera inputs for the MVP.** Use `SAM21Segmenter` in `instance_segmentation.py`; add SAM video propagation for single-camera clips. Produce reusable integer label maps and a per-source object registry before constructing child caches. Temporarily skip geometric cross-view association (step 3 below); retain its plan for later multiview support.
 
 2. **Attach labels to child caches.** In `cache_3d.py`, extend `Cache3D_Base.__init__()` to accept integer labels aligned with `input_points`; retain `_compute_input_points()` and `unproject_points()` geometry unchanged. Extend `render_cache()` and subclass overrides to accept selected IDs. In `Cache3D_Buffer.update_cache()`, maintain labels alongside inserted/replaced points. Existing `Cache3D_Labeled` motion flags do not replace instance IDs.
 
@@ -17,6 +17,8 @@
 ## Step 1: segmentation, matching, and labeling
 
 Status: input alignment and the SAM 2.1 image wrapper/checkpoint loader are implemented. Real-checkpoint accuracy validation, GUI integration, geometric association, video propagation, persistence, and cache label attachment remain pending. The video and geometric snippets below remain partial integration sketches.
+
+**MVP order:** temporarily skip step 3. Single images follow steps 1 → 2 → 5 → 6; single-camera videos follow steps 1 → 2 (object seeding) → 4 → 5 → 6. Sources retain independent object-ID namespaces when combined in the composite.
 
 ### 1. Align inputs
 
@@ -110,14 +112,25 @@ with model_config_session(sam_config="configs/sam2.1/sam2.1_hiera_l.yaml"):
     # Run segmentation, conditioning, and generation here.
 ```
 
-GEN3C registers its runtime root under `_cosmos_predict1_runtime_config`, preserving a caller's root named `config`. Configuration registration/composition must be serialized; the helper never resets caller-owned Hydra state. A caller-owned session must already expose the requested SAM config (normally through `pkg://sam2`). Manual lifecycle checks covered shared startup, prior normal SAM import, repeated composition, construction failure, and incompatible caller sessions. No additional test files were added.
+GEN3C registers its runtime root under `_cosmos_predict1_runtime_config`, preserving a caller's root named `config`. Configuration registration/composition must be serialized; the helper never resets caller-owned Hydra state. A caller-owned session must already expose the requested SAM config (normally through `pkg://sam2`). Review verified the 25 existing tests plus five focused lifecycle smoke checks: standalone composition/cleanup, shared startup/repeated composition/root preservation, prior SAM import, incompatible caller preservation, and construction-failure cleanup. The smoke checks used the pinned SAM package with a synthetic checkpoint and GEN3C's override function with a small configuration fixture; pretrained mask quality and full diffusion inference remain unvalidated.
 
 ### 3. Match views geometrically
+
+**Temporarily skipped for the single-camera MVP.** Preserve the requirements, milestone, and partial code sketch below for later multiview support; this step does not block steps 4–6.
 
 Current status:
 
 - **Pending:** `instance_association.py`, geometric correspondences, pair scoring, and assignment are not implemented.
 - Consume `SegmentedSource`, reusing its `prepared_source` cameras/depth/validity and SAM masks, optional quality scores, and scoped video track IDs. Keep segmentation results and child caches unchanged.
+
+Next implementation milestone: static two-view association.
+
+1. Define `AssociationResult` and pair diagnostics keyed by observation/local IDs and the segmentation revision. Begin with one static source and two calibrated views.
+2. Implement `visible_correspondences()` using the existing geometry helpers, applying validity, ambiguity, depth agreement, and nearest-depth collision handling in both directions. Keep the partial sketch below as a reference, not the complete implementation.
+3. Implement `score_instance_pairs()` and `associate_instances()` with support gates, deterministic one-to-one assignment, and explicit unmatched/ambiguous results. Retain the optional-quality and invalidation requirements below.
+4. Validate synthetic known matches, similar objects, partial occlusion, and no-overlap cases; include unequal image sizes and reordered/corrected segmentation outputs. Then inspect overlays and link diagnostics on a real two-view SAM result.
+
+Completion criterion: correct supported links and explicit unresolved cases, ready for the canonical registry in step 5. Video mask propagation is not a prerequisite for this static milestone; synchronized video association follows once step 4 supplies tracks.
 
 Requirements:
 
@@ -125,10 +138,10 @@ Requirements:
 - Implement `visible_correspondences()` using existing `unproject_points()` / `project_points()` in `forward_warp_utils_pytorch.py`. Unproject valid camera-Z samples into the source's shared world frame and project into the destination camera. Exclude ambiguous pixels in both observations; require valid destination depth. Reject nonfinite coordinates, points behind the camera, and out-of-grid samples before gathering; use nearest sampling consistent with integer pixel centers.
 - Test projected camera-Z against destination depth with configurable absolute and relative tolerance: `abs(z_projected - z_observed) <= abs_tol + rel_tol * z_observed`. Treat points behind an observed foreground surface as occluded. Invalid depth, occlusion, and missing coverage supply no matching evidence; distinguish these from a supported mismatch.
 - Resolve projected point collisions with nearest-depth selection and count unique destination pixels, preventing multiple source samples from inflating support. Compute correspondences in both directions and report depth residuals, support counts, and visible-support fractions.
-- Implement `score_instance_pairs()` using bidirectional mask agreement on visible, valid, unambiguous surfaces, depth residuals, and available SAM mask quality. Require minimum support/count fractions and overlap quality; exclude unassigned/ambiguous destination pixels. Do not use a separate appearance encoder or semantic class names for association.
+- Implement `score_instance_pairs()` using bidirectional mask agreement on visible, valid, unambiguous surfaces, depth residuals, and available SAM mask quality. Require minimum support/count fractions and overlap quality; exclude unassigned/ambiguous destination pixels. Treat predicted IoU/stability as auxiliary quality, not identity probabilities; handle missing quality without rejecting an otherwise supported match or assuming perfect confidence. Do not require raw predicted IoU to lie in `[0, 1]`. Do not use a separate appearance encoder or semantic class names for association.
 - Implement `associate_instances()` with deterministic maximum-score one-to-one assignment per observation pair, allowing unmatched candidates. Gate edges by support, score, and runner-up margins on both sides. With absent/insufficient overlap, retain separate candidates or accept an explicit GUI identity link; do not infer identity from matching native IDs in independent SAM sessions.
-- Return an `AssociationResult` containing accepted links between `(frame_idx, view_id, local_id)` keys, unmatched/ambiguous candidates, and score/support diagnostics. Keep confirmed environment masks outside object assignment. Flag multi-view link conflicts that would identify two distinct objects in one observation as the same object; canonical IDs and registry merges remain step 5 work.
-- Verify with synthetic calibrated scenes: known same-object views, two similar objects, partial occlusion, no overlap, invalid depth, ambiguous masks, unequal resolutions, point collisions, noisy depth, assignment ties, empty/single-view inputs, and static/dynamic pair eligibility. Inspect correspondence overlays and accepted/rejected links on real segmentation outputs after backend validation.
+- Return an `AssociationResult` containing accepted links between `(frame_idx, view_id, local_id)` keys, unmatched/ambiguous candidates, and score/support diagnostics. Bind results to the exact segmentation snapshot/revision and invalidate them after prompt corrections or rediscovery: automatic enumeration IDs may change, and a reused prompt ID may now have a different mask. Keep confirmed environment masks outside object assignment. Flag multi-view link conflicts that would identify two distinct objects in one observation as the same object; canonical IDs and registry merges remain step 5 work.
+- Verify with synthetic calibrated scenes: known same-object views, two similar objects, partial occlusion, no overlap, invalid depth, ambiguous masks, unequal resolutions, point collisions, noisy depth, assignment ties, empty/single-view inputs, and static/dynamic pair eligibility. Include missing/out-of-range predicted quality and association invalidation after reordered automatic proposals or same-ID mask corrections. Inspect correspondence overlays and accepted/rejected links on real segmentation outputs after backend validation.
 
 **Partial implementation sketch:** this illustrates one-direction projection and depth agreement for points already produced by `unproject_points()`. It does not yet implement destination geometry-mask/ambiguity filtering, explicit finite-coordinate checks before indexing, collision resolution, bidirectional scoring, or instance assignment. Complete the requirements above before integration.
 
@@ -158,16 +171,30 @@ Accepted links combine per-view SAM tracks/candidates into canonical identities.
 
 ### 4. Propagate video masks with SAM 2.1
 
-Current status: integration pending. Use SAM's video predictor instead of implementing a separate tracking/reidentification algorithm.
+Purpose:
+
+Keep one selected object's identity consistent across frames of a single-camera video. A GUI selection can then include that object's labeled points throughout the clip. Still-image sources use step 2 directly and bypass propagation.
+
+Current status: integration pending; this is the next video-input milestone while step 3 is deferred. Reuse SAM's video predictor and existing result containers.
 
 Requirements:
 
-- Build one `SAM2VideoPredictor` session per source camera using `build_sam2_video_predictor()` with the SAM 2.1 checkpoint/configuration. Export prepared frames in chronological order and preserve the mapping from SAM's zero-based frame offsets to original observation keys.
-- Construct video predictors within the same application-owned `model_config_session()` used by the image and diffusion loaders; do not introduce another Hydra initializer or clear caller state.
-- Seed objects from selected automatic/image masks with `add_new_mask()`, or from GUI clicks/boxes with `add_new_points_or_box()`. Assign distinct session object IDs; propagate masks using `propagate_in_video()` and threshold output logits at zero.
-- Store native IDs as tracks scoped by `(source_id, view_id, session_id, obj_id)`. Map tracks and accepted cross-view links into canonical IDs in step 5; the same numeric ID from two sessions does not imply the same object.
-- Add newly discovered/user-selected objects as new SAM seeds. Apply corrections through SAM's APIs and rerun affected propagation. A lost/split track remains unresolved until supported association or GUI confirmation; add no separate learned reidentification model. The pinned revision includes the December 2024 predictor update supporting new objects after propagation starts; do not substitute an older September-only checkout.
-- Verify frame-key mapping, two-object propagation, temporary occlusion, new-object seeds, and correction behavior. Inspect real video overlays before relying on track continuity.
+- Accept one `PreparedSource` camera stream with a common prepared image size. Keep RGB, depth, poses, and validity unchanged; export SAM-supported, numerically ordered frames and preserve the offset-to-`(frame_idx, view_id)` mapping, including sparse original frame keys.
+- Build `SAM2VideoPredictor` with the pinned SAM 2.1 checkpoint/configuration inside the shared `model_config_session()`. One source/camera owns one predictor state; serialize changes to that state.
+- Seed selected step-2 masks with `add_new_mask()`, or grouped clicks/boxes with `add_new_points_or_box()`. Keep a stable object ID and name for each seed. Run `propagate_in_video()` instead of independently segmenting and renumbering every frame.
+- Map output rows using the returned `object_ids`; convert logits to prepared-grid boolean masks with `> 0`. Populate `SegmentedSource` / `InstanceObservation` with stable per-session `local_id`, scoped `track_id=(source_id, view_id, session_id, obj_id)`, and optional quality metadata. Propagated quality remains `None` unless explicitly available.
+- Keep absent/fully occluded objects in the session's track metadata, with empty visible masks and no assigned foreground points. Recompute overlap/boundary ambiguity and unassigned regions per frame; retain the existing confirmed-environment policy. Missing depth must not erase RGB tracks.
+- Support later object seeds and corrections through SAM's APIs, reusing IDs for the same object. Repropagate affected frames, including reverse propagation when earlier requested frames need coverage, and refresh derived label maps/render masks while retaining object selection by ID. Unresolved identity switches require GUI correction.
+- Step 5 can map a scoped single-camera track directly to a canonical ID; no step-3 result is required for this MVP. Separate scenes/sessions keep distinct namespaces.
+
+Implementation steps:
+
+1. Add `SAM21VideoSegmenter` in `cosmos_predict1/diffusion/inference/instance_tracking.py`. Implement `from_checkpoint()` and `initialize()` using the shared Hydra helper, `SAM21_MODELS`, ordered frame export, and an explicit frame-key lookup.
+2. Implement `seed_objects()` and `correct_object()` as thin calls to SAM's mask/click/box APIs. Preserve seed names and the mapping between caller object IDs and SAM session IDs.
+3. Implement `propagate()` to collect outputs by original observation key and object ID. Assemble the existing segmentation result types and per-frame uncertainty/environment masks; retain seeded identities through empty frames.
+4. Verify frame ordering, nonconsecutive keys, returned object-row ordering, empty masks, two objects, late seeds, and correction invalidation with predictor-contract tests. Then inspect a real clip with motion and temporary occlusion.
+
+Completion criterion: seed two objects once, produce aligned masks with stable IDs across one camera's clip, and correct a mask while preserving its identity. The resulting records are ready for step-5 labeling and step-6 point attachment.
 
 Official video API sketch (partial integration; frame-key mapping and result storage omitted):
 
@@ -204,4 +231,4 @@ for obs in observations:
 ### 6. Attach to cache points and check consistency
 Add label-loading arguments at cache construction in `gen3c_multiview.demo()` and `Gen3cPersistentModel.seed_model_from_values()`. Normalize labels with the same dimension mapping as RGB into `[B, F, N, V, 1, H, W]`; the static multiview path stores source views along `N`. In `Cache3D_Base.__init__()`, store them as `int64`, separate from `input_mask`. Pixel `(y, x)` labels `input_points[..., y, x, :]` directly, so unprojection mathematics stays unchanged. Keep separate view samples carrying the same canonical ID.
 
-Add `check_label_consistency()` to reproject labels and flag disagreements on mutually visible surfaces, excluding unknowns. Verify with a two-view scene containing two similar objects, plus a moving object that disappears and reappears. Also check environment coverage, label/RGB alignment, and save/load ID preservation. First deliverable: saved label maps, registry, and disagreement overlays for one source; then attach them to a child cache.
+For the MVP, verify that each selected image mask labels exactly its valid unprojected points, and that one camera's video tracks retain IDs through disappearance/reappearance. Check environment coverage, label/RGB alignment, and save/load ID preservation. Deliver labeled points, label maps, registry, and overlays for one image or single-camera clip. Add `check_label_consistency()` and two-view reprojection checks when step 3 resumes.
