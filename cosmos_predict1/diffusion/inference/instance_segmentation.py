@@ -1,9 +1,11 @@
 """Align and segment source observations without assigning cross-image identities."""
 
-from dataclasses import dataclass
 import math
-from typing import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping, Sequence
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -219,38 +221,55 @@ def prepare_source(
     return PreparedSource(prepared)
 
 
+# requirements.txt pins the implementation used by these APIs.
+SAM21_REVISION = "2b90b9f5ceec907a1c18123530e92e794ad901a4"
+SAM21_MODELS = {
+    "tiny": ("configs/sam2.1/sam2.1_hiera_t.yaml", "sam2.1_hiera_tiny.pt"),
+    "small": ("configs/sam2.1/sam2.1_hiera_s.yaml", "sam2.1_hiera_small.pt"),
+    "base_plus": ("configs/sam2.1/sam2.1_hiera_b+.yaml", "sam2.1_hiera_base_plus.pt"),
+    "large": ("configs/sam2.1/sam2.1_hiera_l.yaml", "sam2.1_hiera_large.pt"),
+}
+
+
 @dataclass(frozen=True)
 class SegmentPrompts:
-    """Optional XYXY boxes [N,4] and XY points [M,2] on integer pixel centers.
+    """One object hypothesis, using prepared-image XY pixel coordinates.
 
-    point_labels [M] are 1 for foreground and 0 for background. Backends decide
-    how prompts are grouped into objects; no prompts requests automatic proposals.
+    All points [N,2], their binary point_labels [N], and the optional XYXY box
+    [4] describe ONE object. Separate objects need separate groups and positive
+    local_id values. Reusing a local_id with revised prompts replaces that
+    object's result when segment_source is rerun; it does not establish identity
+    across images. Supply the full revised click set on each call.
     """
 
-    boxes: torch.Tensor | None = None
+    local_id: int
     points: torch.Tensor | None = None
     point_labels: torch.Tensor | None = None
+    box: torch.Tensor | None = None
+    name: str | None = None
+    multimask_output: bool = False
 
 
 @dataclass(frozen=True)
 class InstanceProposal:
-    """Backend mask (bool or probabilities [0,1]) and quality in [0,1]."""
+    """A SAM binary mask on the prepared grid, plus optional quality metadata.
+
+    confidence is SAM's predicted IoU, not calibrated identity probability.
+    Propagated video masks may have no confidence. Native video IDs must be
+    scoped as (source_id, view_id, session_id, obj_id); image prediction sets none.
+    """
 
     mask: torch.Tensor
-    confidence: float
-    class_name: str | None = None
+    confidence: float | None
+    local_id: int
+    name: str | None = None
+    stability_score: float | None = None
+    track_id: tuple[str, int, str, int] | None = None
 
 
 @dataclass(frozen=True)
 class SegmentPrediction:
-    """Masks cover the entire backend input grid, without padding/cropping.
-
-    Backend wrappers must undo their own letterboxing and convert logits to
-    probabilities. environment_mask contains only explicitly confirmed regions.
-    """
-
-    proposals: Sequence[InstanceProposal] = ()
-    environment_mask: torch.Tensor | None = None
+    proposals: tuple[InstanceProposal, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -259,19 +278,19 @@ class InstanceObservation:
     view_id: int
     local_id: int
     mask: torch.Tensor
-    confidence: float
-    appearance: torch.Tensor
-    track_id: int | None = None
-    class_name: str | None = None
+    confidence: float | None
+    name: str
+    stability_score: float | None = None
+    track_id: tuple[str, int, str, int] | None = None
 
 
 @dataclass(frozen=True)
 class SegmentedObservation:
-    """Prepared-grid masks independent of depth validity; no canonical labels.
+    """Full RGB masks independent of depth validity; no canonical labels.
 
-    Instance masks retain their full support, including ambiguous pixels.
-    Consumers must exclude ambiguous_mask before rasterizing accepted labels.
+    Consumers must exclude ambiguous_mask before rasterizing instance labels.
     unassigned_mask excludes candidates, ambiguity, and confirmed environment.
+    Confirmed environment must still intersect geometry validity in step 5.
     """
 
     instances: tuple[InstanceObservation, ...]
@@ -286,248 +305,214 @@ class SegmentedSource:
     observations: Mapping[ObservationKey, SegmentedObservation]
 
 
-def _rgb_for_backend(rgb, source_range, target_range, layout, size=None):
+def _sam_rgb(rgb: torch.Tensor, rgb_range: tuple[float, float]) -> np.ndarray:
+    """SAM owns spatial preprocessing; convert only range/layout/device here."""
     if rgb.ndim != 3 or rgb.shape[0] != 3 or not rgb.is_floating_point() or min(rgb.shape[-2:]) <= 0:
         raise ValueError("RGB must be a nonempty floating tensor [3,H,W]")
-    if len(source_range) != 2 or not all(math.isfinite(v) for v in source_range):
+    if len(rgb_range) != 2 or not all(math.isfinite(v) for v in rgb_range):
         raise ValueError("rgb_range must contain two finite bounds")
-    low, high = source_range
+    low, high = rgb_range
     if low >= high or not torch.isfinite(rgb).all() or (rgb < low).any() or (rgb > high).any():
         raise ValueError("RGB values must lie within the explicitly supplied rgb_range")
-    if layout not in ("CHW", "HWC") or target_range not in ("0_1", "-1_1", "uint8"):
-        raise ValueError("Backend expects CHW/HWC and 0_1, -1_1, or uint8")
-    result = (rgb.float() - low) / (high - low)
-    if size is not None:
-        result = F.interpolate(result[None], size=size, mode="bilinear", align_corners=False)[0]
-    if target_range == "-1_1":
-        result = result * 2 - 1
-    elif target_range == "uint8":
-        result = (result * 255).round().to(torch.uint8)
-    if layout == "HWC":
-        result = result.permute(1, 2, 0)
-    return result.contiguous()
+    image = ((rgb.detach().float() - low) / (high - low) * 255).round().to(torch.uint8)
+    return image.permute(1, 2, 0).cpu().contiguous().numpy()
 
 
-def _binary_mask(mask, size, device, threshold):
-    if not isinstance(mask, torch.Tensor) or tuple(mask.shape) != tuple(size):
-        raise ValueError(f"Backend masks must cover its input grid {tuple(size)}")
-    if mask.dtype != torch.bool:
-        if mask.is_complex() or not torch.isfinite(mask).all() or ((mask < 0) | (mask > 1)).any():
-            raise ValueError("Masks must be boolean or probabilities in [0,1]")
-        mask = mask >= threshold
-    return mask.to(device=device, dtype=torch.bool)
+def _sam_mask(mask, size, device) -> torch.Tensor:
+    mask = torch.as_tensor(mask, device=device)
+    if tuple(mask.shape) != tuple(size):
+        raise ValueError(f"SAM masks must match the prepared image grid {tuple(size)}")
+    # The public predictor returns binary masks as floating NumPy arrays.
+    if not ((mask == 0) | (mask == 1)).all():
+        raise ValueError("SAM must return binary masks, not logits")
+    return mask.bool().clone()
 
 
-class SegmenterAdapter:
-    """Wrap a callable backend(image, prompts) -> SegmentPrediction.
+def _quality(value) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("SAM image quality scores must be finite numbers") from exc
+    if not math.isfinite(value):
+        raise ValueError("SAM quality scores must be finite when supplied")
+    return value
 
-    Input is RGB in the configured layout/range on the prepared RGB device.
-    Optional input_size resizes the image and prompts; full-grid predictions are
-    sampled back to prepared coordinates with categorical nearest sampling.
-    Backend wrappers handle model-specific preprocessing and device transfers.
+
+def _sam_prompts(group: SegmentPrompts, size: tuple[int, int]) -> dict:
+    if type(group.local_id) is not int or group.local_id <= 0:
+        raise ValueError("Prompt groups require a positive integer local_id")
+    if type(group.multimask_output) is not bool:
+        raise ValueError("multimask_output must be boolean")
+    if group.name is not None and not isinstance(group.name, str):
+        raise ValueError("Object name must be a string")
+    h, w = size
+
+    def coords(value, shape):
+        if not isinstance(value, torch.Tensor) or tuple(value.shape) != shape or value.is_complex():
+            raise ValueError(f"Prompt coordinates must be tensors of shape {shape}")
+        value = value.detach().float().cpu()
+        if not torch.isfinite(value).all():
+            raise ValueError("Prompt coordinates must be finite")
+        if ((value[..., 0::2] < 0) | (value[..., 0::2] > w - 1)).any() or (
+            (value[..., 1::2] < 0) | (value[..., 1::2] > h - 1)
+        ).any():
+            raise ValueError("Prompts must lie on the prepared image grid")
+        return value.numpy().copy()
+
+    points = labels = box = None
+    if group.points is not None:
+        if group.points.ndim != 2 or group.points.shape[1] != 2 or len(group.points) == 0:
+            raise ValueError("points must be nonempty [N,2]")
+        points = coords(group.points, (len(group.points), 2))
+        labels = group.point_labels
+        if labels is None or labels.shape != (len(points),) or not ((labels == 0) | (labels == 1)).all():
+            raise ValueError("Each point requires a binary point_label")
+        labels = labels.detach().to(device="cpu", dtype=torch.int32).numpy().copy()
+    elif group.point_labels is not None:
+        raise ValueError("point_labels require points")
+    if group.box is not None:
+        box = coords(group.box, (4,))
+        if (box[2:] <= box[:2]).any():
+            raise ValueError("Box must have positive area and ordered XYXY coordinates")
+    if points is None and box is None:
+        raise ValueError("Each object prompt group requires clicks or a box")
+    return dict(point_coords=points, point_labels=labels, box=box,
+                multimask_output=group.multimask_output, return_logits=False, normalize_coords=True)
+
+
+class SAM21Segmenter:
+    """Thin wrapper for the official SAM 2.1 image APIs; no custom segmentation.
+
+    Use from_checkpoint for production. Direct predictor/generator injection is
+    supported for contract tests and callers already managing a shared SAM model.
+    Instances have mutable predictor state: serialize calls to a shared wrapper.
     """
 
-    def __init__(self, backend: Callable, *, input_layout="HWC", input_range="uint8",
-                 input_size: tuple[int, int] | None = None, mask_threshold=0.5):
-        if input_size is not None and (len(input_size) != 2 or
-                                      any(type(v) is not int or v <= 0 for v in input_size)):
-            raise ValueError("input_size must contain positive integer (height, width)")
-        if not 0 < mask_threshold < 1:
-            raise ValueError("mask_threshold must be between 0 and 1")
-        self.backend = backend
-        self.input_layout = input_layout
-        self.input_range = input_range
-        self.input_size = input_size
-        self.mask_threshold = mask_threshold
+    def __init__(self, predictor, automatic_mask_generator=None):
+        self.predictor = predictor
+        self.automatic_mask_generator = automatic_mask_generator
 
-    @torch.no_grad()
+    @classmethod
+    def from_checkpoint(cls, checkpoint_path: str | Path, *, model_size="large", device="cuda",
+                        automatic_mask_options: Mapping | None = None) -> "SAM21Segmenter":
+        """Build a matching SAM 2.1 model/config pair without downloading weights.
+
+        Quality, stability, sampling and box-NMS options go directly to SAM's
+        automatic generator. requirements.txt includes SAM and GEN3C's dependency pins.
+        """
+        if model_size not in SAM21_MODELS:
+            raise ValueError(f"model_size must be one of {tuple(SAM21_MODELS)}")
+        if not Path(checkpoint_path).is_file():
+            raise FileNotFoundError(f"SAM 2.1 checkpoint does not exist: {checkpoint_path}")
+        options = dict(automatic_mask_options or {})
+        if options.get("output_mode", "binary_mask") != "binary_mask":
+            raise ValueError("SAM21Segmenter requires output_mode='binary_mask'")
+        options["output_mode"] = "binary_mask"
+        from hydra import initialize_config_module
+        from hydra.core.global_hydra import GlobalHydra
+
+        if GlobalHydra.instance().is_initialized():
+            raise RuntimeError("Construct SAM models outside an active Hydra session; caller state is preserved")
+        # Enter before the first sam2 import: SAM otherwise initializes Hydra
+        # globally in __init__.py. Re-enter for every build, even if SAM is cached.
+        with initialize_config_module("sam2", version_base="1.2"):
+            try:
+                from sam2.build_sam import build_sam2
+                from sam2.sam2_image_predictor import SAM2ImagePredictor
+                from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+            except ModuleNotFoundError as exc:
+                if exc.name == "sam2" or (exc.name or "").startswith("sam2."):
+                    raise ImportError("Install SAM 2.1 with pip install -r requirements.txt") from exc
+                raise
+            model = build_sam2(SAM21_MODELS[model_size][0], str(checkpoint_path), device=device, mode="eval")
+            return cls(SAM2ImagePredictor(model), SAM2AutomaticMaskGenerator(model, **options))
+
+    @torch.inference_mode()
     def segment(self, rgb: torch.Tensor, *, rgb_range: tuple[float, float],
-                prompts: SegmentPrompts | None = None) -> SegmentPrediction:
-        h, w = rgb.shape[-2:]
-        size = self.input_size or (h, w)
-        image = _rgb_for_backend(rgb, rgb_range, self.input_range, self.input_layout, self.input_size)
-        prompts = prompts or SegmentPrompts()
-        scaled = {}
-        for name, width in (("boxes", 4), ("points", 2)):
-            value = getattr(prompts, name)
-            if value is None:
-                scaled[name] = None
-                continue
-            if value.ndim != 2 or value.shape[1] != width or not torch.isfinite(value).all():
-                raise ValueError(f"{name} must be finite [N,{width}] coordinates")
-            value = value.to(device=rgb.device, dtype=torch.float32).clone()
-            if ((value[:, 0::2] < 0) | (value[:, 0::2] > w - 1)).any() or (
-                (value[:, 1::2] < 0) | (value[:, 1::2] > h - 1)
-            ).any():
-                raise ValueError("Prompts must lie on the prepared image grid")
-            if name == "boxes" and (value[:, 2:] < value[:, :2]).any():
-                raise ValueError("Boxes must use ordered XYXY coordinates")
-            scale = value.new_tensor([size[1] / w, size[0] / h] * (width // 2))
-            scaled[name] = (value + 0.5) * scale - 0.5
-        labels = prompts.point_labels
-        if prompts.points is not None:
-            if labels is None or labels.shape != (len(prompts.points),) or not ((labels == 0) | (labels == 1)).all():
-                raise ValueError("Each point needs a binary point_label")
-            labels = labels.to(device=rgb.device, dtype=torch.int64)
-        elif labels is not None:
-            raise ValueError("point_labels require points")
-        prediction = self.backend(image, SegmentPrompts(point_labels=labels, **scaled))
+                prompts: Sequence[SegmentPrompts] | None = None) -> SegmentPrediction:
+        """None requests automatic candidates; a sequence requests only its objects.
 
-        def remap(mask):
-            result = _binary_mask(mask, size, rgb.device, self.mask_threshold)
-            return _nearest_resize(result, (h, w)) if size != (h, w) else result
-
+        Each group yields at most one mask. For multimask predictions select the
+        highest predicted-IoU nonempty alternative. No NMS is applied across user
+        groups: genuine contained objects remain distinct, with ambiguous overlap.
+        Automatic discovery delegates all proposal filtering and NMS to SAM.
+        """
+        image = _sam_rgb(rgb, rgb_range)
+        size, device = image.shape[:2], rgb.device
         proposals = []
-        for proposal in prediction.proposals:
-            confidence = float(proposal.confidence)
-            if not math.isfinite(confidence) or not 0 <= confidence <= 1:
-                raise ValueError("Segmentation confidence must be finite and in [0,1]")
-            proposals.append(InstanceProposal(remap(proposal.mask), confidence, proposal.class_name))
-        environment = remap(prediction.environment_mask) if prediction.environment_mask is not None else None
-        return SegmentPrediction(tuple(proposals), environment)
-
-
-class AppearanceEncoderAdapter:
-    """Wrap one encoder(masked_crop, crop_mask) -> floating embedding [D].
-
-    Crops tightly bound the object; background pixels are zeroed in the backend's
-    input range. The encoder receives the mask as well, and must exclude those
-    pixels from pooling/preprocessing. Use this same encoder across the source.
-    Outputs are finite, nonzero, L2-normalized vectors on the RGB device.
-    """
-
-    def __init__(self, backend: Callable, *, input_layout="CHW", input_range="0_1"):
-        self.backend = backend
-        self.input_layout = input_layout
-        self.input_range = input_range
-
-    @torch.no_grad()
-    def encode(self, rgb: torch.Tensor, mask: torch.Tensor, *, rgb_range: tuple[float, float]) -> torch.Tensor:
-        if mask.shape != rgb.shape[-2:] or mask.dtype != torch.bool or mask.device != rgb.device or not mask.any():
-            raise ValueError("Appearance mask must be nonempty boolean [H,W] on the RGB device")
-        y, x = mask.nonzero(as_tuple=True)
-        top, bottom, left, right = y.min().item(), y.max().item() + 1, x.min().item(), x.max().item() + 1
-        crop_mask = mask[top:bottom, left:right]
-        crop = _rgb_for_backend(rgb[:, top:bottom, left:right], rgb_range,
-                                self.input_range, self.input_layout)
-        broadcast_mask = crop_mask[None] if self.input_layout == "CHW" else crop_mask[..., None]
-        crop = crop.masked_fill(~broadcast_mask, 0)
-        embedding = self.backend(crop, crop_mask)
-        if not isinstance(embedding, torch.Tensor) or embedding.ndim != 1 or embedding.numel() == 0:
-            raise ValueError("Appearance encoder must return an embedding [D]")
-        if not embedding.is_floating_point() or not torch.isfinite(embedding).all():
-            raise ValueError("Appearance embedding must be finite floating point")
-        embedding = embedding.to(device=rgb.device, dtype=torch.float32)
-        norm = torch.linalg.vector_norm(embedding)
-        if not torch.isfinite(norm) or norm <= 0:
-            raise ValueError("Appearance embedding must have a finite nonzero norm")
-        return embedding / norm
-
-
-def clean_instance_proposals(
-    proposals: Sequence[InstanceProposal], *, min_confidence=0.0, min_area=1,
-    duplicate_iou=0.9, duplicate_area_ratio=0.95, boundary_width=0,
-) -> tuple[tuple[InstanceProposal, ...], torch.Tensor]:
-    """Confidence-ranked duplicate suppression and conservative uncertainty.
-
-    Suppress only near-equal-area, high-IoU masks. Strictly contained masks with
-    different support survive even at high IoU. All remaining overlaps are
-    ambiguous. boundary_width optionally marks an inner boundary band uncertain.
-    Empty/low-quality proposals are discarded. Masks remain unchanged.
-    """
-    if not 0 <= min_confidence <= 1 or not 0 < duplicate_iou <= 1 or not 0 < duplicate_area_ratio <= 1:
-        raise ValueError("Quality and duplicate thresholds must lie in [0,1] (duplicate thresholds > 0)")
-    if type(min_area) is not int or min_area < 1 or type(boundary_width) is not int or boundary_width < 0:
-        raise ValueError("min_area must be positive and boundary_width nonnegative integers")
-    if not proposals:
-        raise ValueError("No mask grid available; segment_source handles empty predictions")
-    template = proposals[0].mask
-    if template.ndim != 2 or template.dtype != torch.bool:
-        raise ValueError("Proposal masks must be boolean [H,W]")
-    for proposal in proposals:
-        if proposal.mask.shape != template.shape or proposal.mask.device != template.device or proposal.mask.dtype != torch.bool:
-            raise ValueError("Proposal masks must share a boolean [H,W] grid and device")
-        if not math.isfinite(proposal.confidence) or not 0 <= proposal.confidence <= 1:
-            raise ValueError("Segmentation confidence must be finite and in [0,1]")
-    kept = []
-    for candidate in sorted(proposals, key=lambda p: p.confidence, reverse=True):
-        area = int(candidate.mask.sum())
-        if area < min_area or candidate.confidence < min_confidence:
-            continue
-        duplicate = False
-        for previous in kept:
-            other_area = int(previous.mask.sum())
-            intersection = int((candidate.mask & previous.mask).sum())
-            # Containment alone must never establish duplicate identity.
-            strictly_contained = intersection == min(area, other_area) and area != other_area
-            if (not strictly_contained and intersection / (area + other_area - intersection) >= duplicate_iou
-                    and min(area, other_area) / max(area, other_area) >= duplicate_area_ratio):
-                duplicate = True
-                break
-        if not duplicate:
-            kept.append(candidate)
-    occupied = torch.zeros_like(template)
-    ambiguous = torch.zeros_like(template)
-    for proposal in kept:
-        mask = proposal.mask
-        ambiguous |= occupied & mask
-        occupied |= mask
-        if boundary_width:
-            # Explicit padding treats pixels outside the image as background.
-            padded = F.pad(mask[None, None].float(), (boundary_width,) * 4, value=0)
-            eroded = -F.max_pool2d(-padded, 2 * boundary_width + 1, stride=1)[0, 0] > 0
-            ambiguous |= mask & ~eroded
-    return tuple(kept), ambiguous
+        if prompts is None:
+            if self.automatic_mask_generator is None:
+                raise ValueError("Automatic discovery requires a SAM2AutomaticMaskGenerator")
+            for local_id, record in enumerate(self.automatic_mask_generator.generate(image), start=1):
+                mask = _sam_mask(record["segmentation"], size, device)
+                if mask.any():
+                    proposals.append(InstanceProposal(mask, _quality(record["predicted_iou"]), local_id,
+                                                       stability_score=_quality(record["stability_score"])))
+        else:
+            prompts = tuple(prompts)
+            arguments = [_sam_prompts(group, size) for group in prompts]
+            if len({group.local_id for group in prompts}) != len(prompts):
+                raise ValueError("Each object prompt group requires a unique local_id within its observation")
+            if prompts:
+                self.predictor.set_image(image)
+            for group, kwargs in zip(prompts, arguments):
+                masks, qualities, _ = self.predictor.predict(**kwargs)
+                masks = np.asarray(masks)
+                qualities = np.asarray(qualities)
+                if masks.ndim != 3 or masks.shape[1:] != size or qualities.shape != (len(masks),):
+                    raise ValueError("SAM must return masks [Q,H,W] and quality scores [Q]")
+                alternatives = [(_sam_mask(mask, size, device), _quality(score))
+                                for mask, score in zip(masks, qualities)]
+                alternatives = [(mask, score) for mask, score in alternatives if mask.any()]
+                if alternatives:
+                    mask, score = max(alternatives, key=lambda pair: pair[1])
+                    proposals.append(InstanceProposal(mask, score, group.local_id, group.name))
+        return SegmentPrediction(tuple(proposals))
 
 
 def segment_source(
-    source: PreparedSource, segmenter: SegmenterAdapter, appearance_encoder: AppearanceEncoderAdapter, *,
-    rgb_range: tuple[float, float], prompts: Mapping[ObservationKey, SegmentPrompts] | None = None,
+    source: PreparedSource, segmenter: SAM21Segmenter, *, rgb_range: tuple[float, float],
+    prompts: Mapping[ObservationKey, Sequence[SegmentPrompts]] | None = None,
     environment_masks: Mapping[ObservationKey, torch.Tensor] | None = None,
-    min_confidence=0.0, min_area=1, duplicate_iou=0.9, duplicate_area_ratio=0.95, boundary_width=0,
+    boundary_width: int = 0,
 ) -> SegmentedSource:
-    """Discover candidates on prepared RGB, keeping every observation key.
+    """Keep SAM masks keyed by observation, independent of geometry validity.
 
-    Prompts and user-confirmed environment masks use prepared coordinates. An
-    explicit environment mask is combined with backend-confirmed environment;
-    candidate regions and uncertainty are always excluded. Depth validity never
-    erases candidates or RGB environment evidence. Step 5 must intersect valid
-    geometry before assigning label 0 or positive canonical IDs.
+    Unspecified observation keys use automatic discovery; an explicit empty list
+    requests no objects. Environment masks must be explicitly confirmed by the
+    caller. Recompute after corrections with unchanged prompt local_ids; cached
+    association/canonical labels must then be invalidated by their future owner.
+    No generated canonical IDs, GUI, video propagation, or association is implied.
     """
+    if type(boundary_width) is not int or boundary_width < 0:
+        raise ValueError("boundary_width must be a nonnegative integer")
     prompts = prompts or {}
     environment_masks = environment_masks or {}
     if (set(prompts) | set(environment_masks)) - set(source.observations):
         raise ValueError("Prompts/environment masks reference unknown observation keys")
     results = {}
-    embedding_size = None
     for key, observation in source.observations.items():
         prediction = segmenter.segment(observation.rgb, rgb_range=rgb_range, prompts=prompts.get(key))
         empty = torch.zeros(observation.rgb.shape[-2:], dtype=torch.bool, device=observation.rgb.device)
-        # Run cleanup even for empty backend results to validate quality settings.
-        cleanup_input = prediction.proposals or (InstanceProposal(empty, 0.0),)
-        kept, ambiguous = clean_instance_proposals(
-            cleanup_input, min_confidence=min_confidence, min_area=min_area,
-            duplicate_iou=duplicate_iou, duplicate_area_ratio=duplicate_area_ratio, boundary_width=boundary_width,
-        )
         instances = []
-        occupied = empty.clone()
-        for local_id, proposal in enumerate(kept, start=1):
-            appearance = appearance_encoder.encode(observation.rgb, proposal.mask, rgb_range=rgb_range)
-            if embedding_size is not None and appearance.numel() != embedding_size:
-                raise ValueError("One source requires comparable appearance embeddings of a fixed dimension")
-            embedding_size = appearance.numel()
-            instances.append(InstanceObservation(*key, local_id, proposal.mask, proposal.confidence,
-                                                 appearance, class_name=proposal.class_name))
-            occupied |= proposal.mask
-        environment = empty.clone()
-        if prediction.environment_mask is not None:
-            environment |= prediction.environment_mask
-        if key in environment_masks:
-            supplied = environment_masks[key]
-            if supplied.dtype != torch.bool or supplied.shape != empty.shape or supplied.device != empty.device:
-                raise ValueError("Confirmed environment must be boolean [H,W] on the prepared RGB device")
-            environment |= supplied
-        environment &= ~occupied & ~ambiguous
-        unassigned = ~occupied & ~ambiguous & ~environment
-        results[key] = SegmentedObservation(tuple(instances), ambiguous, unassigned, environment)
+        occupied, ambiguous = empty.clone(), empty.clone()
+        for proposal in prediction.proposals:
+            mask = proposal.mask
+            instances.append(InstanceObservation(
+                *key, proposal.local_id, mask, proposal.confidence,
+                proposal.name if proposal.name is not None else f"Object {proposal.local_id}",
+                proposal.stability_score, proposal.track_id,
+            ))
+            ambiguous |= occupied & mask
+            occupied |= mask
+            if boundary_width:
+                padded = F.pad(mask[None, None].float(), (boundary_width,) * 4, value=0)
+                eroded = -F.max_pool2d(-padded, 2 * boundary_width + 1, stride=1)[0, 0] > 0
+                ambiguous |= mask & ~eroded
+        environment = environment_masks.get(key, empty)
+        if environment.dtype != torch.bool or environment.shape != empty.shape or environment.device != empty.device:
+            raise ValueError("Confirmed environment must be boolean [H,W] on the prepared RGB device")
+        environment = environment & ~occupied & ~ambiguous
+        results[key] = SegmentedObservation(tuple(instances), ambiguous,
+                                            ~occupied & ~ambiguous & ~environment, environment)
     return SegmentedSource(source, results)

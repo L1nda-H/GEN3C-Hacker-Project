@@ -8,7 +8,7 @@
 - Expose the existing `render_cache()` camera interface, with explicit object selections and a replaceable fusion policy.
 
 ## Implementation steps
-1. **Segment, match, and label inputs.** Refactor `instance_segmentation.py` for SAM 2.1 and add `instance_association.py` under `cosmos_predict1/diffusion/inference/`. Produce reusable integer label maps and a per-source object registry before constructing child caches. For videos, propagate SAM masks before final cross-view association and labeling.
+1. **Segment, match, and label inputs.** Use `SAM21Segmenter` in `instance_segmentation.py` and add `instance_association.py` under `cosmos_predict1/diffusion/inference/`. Produce reusable integer label maps and a per-source object registry before constructing child caches. For videos, propagate SAM masks before final cross-view association and labeling.
 
 2. **Attach labels to child caches.** In `cache_3d.py`, extend `Cache3D_Base.__init__()` to accept integer labels aligned with `input_points`; retain `_compute_input_points()` and `unproject_points()` geometry unchanged. Extend `render_cache()` and subclass overrides to accept selected IDs. In `Cache3D_Buffer.update_cache()`, maintain labels alongside inserted/replaced points. Existing `Cache3D_Labeled` motion flags do not replace instance IDs.
 
@@ -16,7 +16,7 @@
 
 ## Step 1: segmentation, matching, and labeling
 
-Status: input alignment is implemented. The existing generic segmentation scaffold must be refactored for SAM 2.1; checkpoint integration, geometric association, video propagation, persistence, and cache label attachment remain pending. Snippets below illustrate intended API use; they do not indicate completed integration.
+Status: input alignment and the SAM 2.1 image wrapper/checkpoint loader are implemented. Real-checkpoint accuracy validation, GUI integration, geometric association, video propagation, persistence, and cache label attachment remain pending. The video and geometric snippets below remain partial integration sketches.
 
 ### 1. Align inputs
 
@@ -40,44 +40,62 @@ Requirements:
 
 Current status:
 
-- `PreparedSource` and per-observation mask containers are reusable. SAM 2.1 is selected; its real predictors are not yet connected.
-- The existing 23 tests cover input alignment and the previous generic scaffold. Update segmentation tests for the SAM 2.1 contract and validate masks on real inputs.
+- **Implemented:** `SAM21Segmenter.from_checkpoint()` constructs the official image predictor and automatic mask generator. `segment_source()` retains prepared observation keys, grouped prompts, optional quality metadata, names, ambiguity, unassigned regions, and confirmed environment masks.
+- **Verified:** 25 local tests cover input alignment/cache geometry and mocked public SAM API contracts. The checkpoint factory is tested with CUDA as its default device. The 399/400-pixel alternate-mask regression now produces one instance without duplicate-induced ambiguity. Separate contained prompt groups remain separate.
 
 Requirements:
 
-- Add `SAM21Segmenter` in `instance_segmentation.py` as a thin wrapper around `SAM2ImagePredictor` and `SAM2AutomaticMaskGenerator`. Pin a SAM 2.1 package revision, checkpoint, and matching configuration; preserve the existing GEN3C dependency pins.
+- Use `SAM21Segmenter` as a thin wrapper around `SAM2ImagePredictor` and `SAM2AutomaticMaskGenerator`. `requirements.txt` includes SAM as a pipeline dependency, pins the official repository at `2b90b9f5ceec907a1c18123530e92e794ad901a4`, and preserves GEN3C's existing dependency pins. `SAM21_MODELS` pairs each 2.1 checkpoint variant with its matching packaged configuration. Weights are supplied explicitly; loading never silently downloads them.
 - Refactor `segment_source()` to consume `PreparedSource`, preserve `(frame_idx, view_id)` keys, and convert prepared RGB to uint8 HWC. Let SAM's predictor perform internal resizing and return masks at prepared-image resolution; remove the generic adapter's independent backend resizing/prompt scaling.
-- Use `SAM2AutomaticMaskGenerator.generate()` for class-agnostic candidate discovery. Use its predicted-quality/stability thresholds and duplicate suppression directly. Keep only project-specific overlap/uncertainty handling after SAM postprocessing.
+- Use `SAM2AutomaticMaskGenerator.generate()` for class-agnostic candidate discovery. Pass quality/stability, point sampling, and box-NMS options directly through `automatic_mask_options`. Keep only project-specific overlap/boundary uncertainty handling after SAM postprocessing. Missing objects need explicit prompts; automatic NMS cannot guarantee preservation of every contained object.
 - For GUI initialization/refinement, call `SAM2ImagePredictor.set_image()` and `predict()` with grouped object-specific clicks/boxes in prepared-image coordinates. Use `multimask_output=False` for a single mask, or select the best-quality alternative per prompt group. Different hypotheses for one prompt are not distinct objects.
-- Return boolean `[H, W]` masks with observation-local IDs and SAM quality scores. Retain `track_id` when supplied by the video path. Remove the required `appearance` field and appearance-encoder argument; allow missing confidence for propagated frames because the public video API returns mask logits, not calibrated per-frame quality scores.
+- Return boolean `[H, W]` masks with observation-local IDs and SAM quality scores. These are predicted IoU/stability, not calibrated identity confidence. Retain `track_id` when supplied by the future video path. `InstanceObservation` has no appearance-vector requirement and allows missing confidence for propagated frames because the public video API returns mask logits, not calibrated per-frame quality scores.
 - Keep segmentation independent of geometry validity. Preserve unresolved overlaps as ambiguous and unclaimed regions as unassigned. Establish environment regions through GUI mask prompts/painting or user confirmation of the residual after reviewing object masks; label 0 only on confirmed, valid, unambiguous pixels. Automatic proposals alone do not confirm the environment.
 - Expose object overlays/list entries with default names such as “Object 3” and optional user names. After association/labeling, GUI selection addresses canonical IDs; mask corrections update affected association and point labels while retaining an existing ID when identity is unchanged.
-- Replace tests for arbitrary backends/appearance encoding/custom suppression with SAM-wrapper contract checks: keyed prompts and object grouping, prepared-grid masks, one chosen hypothesis per prompt, retained empty observations, independent depth validity, uncertainty/environment handling, and GUI corrections. Inspect real masks on single-image and two-view examples.
+- SAM-wrapper contract tests cover keyed prompts and object grouping, prepared-grid masks, one chosen nonempty hypothesis per prompt, retained empty observations, independent depth validity, uncertainty/environment handling, and replacement of an object's prompts while preserving its explicit local ID. GUI corrections themselves remain unimplemented. Inspect real masks on single-image and two-view examples.
 
-Planned scaffold changes in `instance_segmentation.py`:
+Implemented scaffold changes in `instance_segmentation.py`:
 
-- Replace `SegmenterAdapter` with `SAM21Segmenter`; keep `SegmentPrompts` with explicit per-object prompt grouping and mask/result containers.
-- Remove `AppearanceEncoderAdapter`, appearance-vector validation, and the mandatory appearance field/argument from `InstanceObservation` / `segment_source()`.
-- Remove `clean_instance_proposals()` from the active design and its custom duplicate-suppression tests. Compute only unresolved overlap/boundary masks needed by labeling; delegate proposal filtering to SAM.
+- Replaced `SegmenterAdapter` with `SAM21Segmenter`; `SegmentPrompts` describes one object's clicks/box, explicit positive `local_id`, optional name, and multimask setting. All prompts stay in prepared-image coordinates; SAM handles its own resizing.
+- Removed `AppearanceEncoderAdapter`, appearance-vector validation, and the mandatory appearance field/argument from `InstanceObservation` / `segment_source()`.
+- Removed `clean_instance_proposals()` and its custom duplicate-suppression tests. Only unresolved overlap/boundary masks are computed locally; proposal filtering is delegated to SAM.
 
-Official image API sketch (setup variables are caller-provided):
+Install into an existing GEN3C environment (Python >=3.10; current torch 2.6.0 and torchvision 0.21.0 pins satisfy SAM's minimums):
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+SAM can build an optional CUDA postprocessing extension; follow the [official installation notes](https://github.com/facebookresearch/sam2/blob/2b90b9f5ceec907a1c18123530e92e794ad901a4/INSTALL.md) for matching CUDA/PyTorch tooling on GCP. Download the [official large 2.1 checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt) to `checkpoints/sam2.1_hiera_large.pt`. Validate image quality on representative project inputs rather than inferring it from the upstream video benchmark.
+
+Image wrapper usage (`prepared` is the output of `prepare_source()`):
 
 ```python
-from sam2.build_sam import build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
-from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
-
-model = build_sam2("configs/sam2.1/sam2.1_hiera_l.yaml", checkpoint_path)
-predictor = SAM2ImagePredictor(model)
-predictor.set_image(rgb_uint8_hwc)  # Prepared RGB, unchanged pixel grid.
-masks, quality, _ = predictor.predict(
-    point_coords=points_xy, point_labels=point_labels,
-    box=box_xyxy, multimask_output=False,  # One object prompt group.
+import torch
+from cosmos_predict1.diffusion.inference.instance_segmentation import (
+    SAM21Segmenter, SegmentPrompts, segment_source,
 )
-# Alternative discovery entry point; its outputs already include filtering.
-proposals = SAM2AutomaticMaskGenerator(model).generate(rgb_uint8_hwc)
-# Each proposal supplies segmentation, predicted_iou, and stability_score.
+
+segmenter = SAM21Segmenter.from_checkpoint(
+    "checkpoints/sam2.1_hiera_large.pt", model_size="large", device="cuda",
+    automatic_mask_options={"pred_iou_thresh": 0.8, "stability_score_thresh": 0.95},
+)
+with torch.autocast("cuda", dtype=torch.bfloat16):
+    # Automatic discovery on every prepared observation:
+    discovered = segment_source(prepared, segmenter, rgb_range=(-1, 1))
+    # Prompted replacement for one observation; each group describes one object.
+    refined = segment_source(
+        prepared, segmenter, rgb_range=(-1, 1),  # Use the actual prepared RGB range.
+        prompts={(frame_idx, view_id): [SegmentPrompts(
+            local_id=3, points=torch.tensor([[x, y]]), point_labels=torch.tensor([1]),
+            name="Selected object", multimask_output=True,
+        )]},
+    )
 ```
+
+Multimask output selects the highest-quality nonempty alternative **within one group**. Separate groups are never merged by local NMS. Prompted calls replace that observation's object list; supply all objects to retain, reusing IDs with their full revised clicks/boxes. An explicit empty list requests no objects; omitted observation keys use automatic discovery. Automatic IDs are provisional enumeration values and may change after rediscovery. Reusing a prompt ID across independent images does not establish identity.
+
+Pass user-confirmed boolean `[H,W]` masks through `environment_masks`; SAM never confirms environment automatically. Rerunning segmentation returns a new result, leaves source geometry unchanged, and requires downstream association/label invalidation once those stages exist. Shared predictors have mutable image state; serialize access to a wrapper. Run the contract suite with `python -m unittest discover -s tests -p 'test_*seg*.py' -v`.
 
 ### 3. Match views geometrically
 
@@ -132,7 +150,7 @@ Requirements:
 - Build one `SAM2VideoPredictor` session per source camera using `build_sam2_video_predictor()` with the SAM 2.1 checkpoint/configuration. Export prepared frames in chronological order and preserve the mapping from SAM's zero-based frame offsets to original observation keys.
 - Seed objects from selected automatic/image masks with `add_new_mask()`, or from GUI clicks/boxes with `add_new_points_or_box()`. Assign distinct session object IDs; propagate masks using `propagate_in_video()` and threshold output logits at zero.
 - Store native IDs as tracks scoped by `(source_id, view_id, session_id, obj_id)`. Map tracks and accepted cross-view links into canonical IDs in step 5; the same numeric ID from two sessions does not imply the same object.
-- Add newly discovered/user-selected objects as new SAM seeds. Apply corrections through SAM's APIs and rerun affected propagation. A lost/split track remains unresolved until supported association or GUI confirmation; add no separate learned reidentification model.
+- Add newly discovered/user-selected objects as new SAM seeds. Apply corrections through SAM's APIs and rerun affected propagation. A lost/split track remains unresolved until supported association or GUI confirmation; add no separate learned reidentification model. The pinned revision includes the December 2024 predictor update supporting new objects after propagation starts; do not substitute an older September-only checkout.
 - Verify frame-key mapping, two-object propagation, temporary occlusion, new-object seeds, and correction behavior. Inspect real video overlays before relying on track continuity.
 
 Official video API sketch (partial integration; frame-key mapping and result storage omitted):
@@ -153,7 +171,7 @@ for frame_offset, object_ids, mask_logits in video.propagate_in_video(state):
 ```
 
 ### 5. Assign canonical labels and persist
-Implement `ObjectRegistry` with `allocate()`, `bind_observation()`, and `merge_ids()`; allocate positive IDs within each source and preserve observation-to-ID mappings. Track merges/corrections update all affected maps; names are user-supplied or generic. Rasterize accepted disjoint masks; reserve `0` for confirmed, valid, unambiguous environment pixels and `-1` for unresolved/invalid regions. Persist integer maps and validity in NPZ, and names, confidence, observations, and ID mappings in JSON.
+Implement `ObjectRegistry` with `allocate()`, `bind_observation()`, and `merge_ids()`; allocate positive IDs within each source and preserve observation-to-ID mappings. Track merges/corrections update all affected maps; names are user-supplied or generic. Rasterize accepted disjoint masks; reserve `0` for confirmed, valid, unambiguous environment pixels and `-1` for unresolved/invalid regions. Persist integer maps and validity in NPZ, and names, optional quality scores, observations, ID mappings, SAM code revision, configuration, and checkpoint hash in JSON.
 
 ```python
 # Rasterize one image; `observations` contains only its instance masks.

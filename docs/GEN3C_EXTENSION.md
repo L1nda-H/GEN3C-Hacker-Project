@@ -14,8 +14,9 @@
 
 - **Input alignment complete:** `prepare_source()` preserves frame/view keys, validates OpenCV inputs, and packs inputs for existing caches.
 - Crop/resize updates intrinsics and uses integer-safe half-pixel nearest sampling for depth/masks/labels; validity stays separate, and ray distance converts to camera-Z.
-- **SAM 2.1 selected:** refactor the generic scaffold to use its image predictor, automatic mask generator, and video predictor. Reuse official preprocessing, proposal filtering, and mask propagation.
-- Remove separate appearance encoding, custom duplicate suppression, and custom tracking from the active implementation plan. The existing 23 tests cover the previous scaffold; update the affected contracts and validate real SAM outputs.
+- **SAM 2.1 image wrapper implemented:** `SAM21Segmenter` uses the official image predictor and automatic mask generator; `requirements.txt` includes the pinned SAM repository as a pipeline dependency while preserving GEN3C dependency pins. SAM performs spatial preprocessing and proposal filtering. The official video predictor remains planned for video propagation.
+- Target CUDA inference on appropriately provisioned GCP hardware, starting with SAM 2.1 large and bfloat16 autocast. No CPU inference fallback is planned.
+- Separate appearance encoding and custom duplicate suppression have been removed; custom tracking is excluded from the plan. **25 local tests pass**, covering alignment and mocked SAM API contracts. Real-checkpoint overlay/accuracy validation on GCP and GUI integration remain pending.
 - Preserve observation keys and geometry validity; retain ambiguity, unassigned regions, and GUI-confirmed environment masks. Use generic/user-assigned object names.
 - Associate masks across cameras using depth and poses; reuse scoped SAM IDs within each video session. Assign canonical IDs before GUI object selection and cache point labeling.
 - Save persistent object IDs, label maps, and source metadata.
