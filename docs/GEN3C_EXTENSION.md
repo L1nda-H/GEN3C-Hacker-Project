@@ -14,10 +14,10 @@
 
 - **Input alignment complete:** `prepare_source()` preserves frame/view keys, validates OpenCV inputs, and packs inputs for existing caches.
 - Crop/resize updates intrinsics and uses integer-safe half-pixel nearest sampling for depth/masks/labels; validity stays separate, and ray distance converts to camera-Z.
-- **Segmentation contract complete:** injectable promptable segmentation and masked appearance adapters preserve observation keys, suppress duplicate proposals, and retain ambiguity, unassigned regions, and explicitly confirmed environment masks independently of depth validity.
-- **Verified:** 23 CPU tests pass. Callers supply synchronized observations with consistent coordinates/units. Real-backend mask overlay inspection, association, tracking, persistence, and cache label attachment remain pending.
-- Segment object instances and retain environment regions.
-- Associate instances across views and track them across video frames.
+- **SAM 2.1 selected:** refactor the generic scaffold to use its image predictor, automatic mask generator, and video predictor. Reuse official preprocessing, proposal filtering, and mask propagation.
+- Remove separate appearance encoding, custom duplicate suppression, and custom tracking from the active implementation plan. The existing 23 tests cover the previous scaffold; update the affected contracts and validate real SAM outputs.
+- Preserve observation keys and geometry validity; retain ambiguity, unassigned regions, and GUI-confirmed environment masks. Use generic/user-assigned object names.
+- Associate masks across cameras using depth and poses; reuse scoped SAM IDs within each video session. Assign canonical IDs before GUI object selection and cache point labeling.
 - Save persistent object IDs, label maps, and source metadata.
 
 ## Composite cache
