@@ -46,6 +46,7 @@ Current status:
 Requirements:
 
 - Use `SAM21Segmenter` as a thin wrapper around `SAM2ImagePredictor` and `SAM2AutomaticMaskGenerator`. `requirements.txt` includes SAM as a pipeline dependency, pins the official repository at `2b90b9f5ceec907a1c18123530e92e794ad901a4`, and preserves GEN3C's existing dependency pins. `SAM21_MODELS` pairs each 2.1 checkpoint variant with its matching packaged configuration. Weights are supplied explicitly; loading never silently downloads them.
+- Share configuration initialization through `cosmos_predict1.utils.model_config.model_config_session()`. Application startup exposes SAM's package configs alongside GEN3C's ConfigStore registrations; both loaders compose independently without nested initialization. `gen3c_multiview` owns this session at its CLI entry point. Reuse a prior `import sam2` session when the requested config is accessible; reject incompatible caller sessions without clearing or replacing them. Standalone loaders own a temporary session only when none exists.
 - Refactor `segment_source()` to consume `PreparedSource`, preserve `(frame_idx, view_id)` keys, and convert prepared RGB to uint8 HWC. Let SAM's predictor perform internal resizing and return masks at prepared-image resolution; remove the generic adapter's independent backend resizing/prompt scaling.
 - Use `SAM2AutomaticMaskGenerator.generate()` for class-agnostic candidate discovery. Pass quality/stability, point sampling, and box-NMS options directly through `automatic_mask_options`. Keep only project-specific overlap/boundary uncertainty handling after SAM postprocessing. Missing objects need explicit prompts; automatic NMS cannot guarantee preservation of every contained object.
 - For GUI initialization/refinement, call `SAM2ImagePredictor.set_image()` and `predict()` with grouped object-specific clicks/boxes in prepared-image coordinates. Use `multimask_output=False` for a single mask, or select the best-quality alternative per prompt group. Different hypotheses for one prompt are not distinct objects.
@@ -96,6 +97,20 @@ with torch.autocast("cuda", dtype=torch.bfloat16):
 Multimask output selects the highest-quality nonempty alternative **within one group**. Separate groups are never merged by local NMS. Prompted calls replace that observation's object list; supply all objects to retain, reusing IDs with their full revised clicks/boxes. An explicit empty list requests no objects; omitted observation keys use automatic discovery. Automatic IDs are provisional enumeration values and may change after rediscovery. Reusing a prompt ID across independent images does not establish identity.
 
 Pass user-confirmed boolean `[H,W]` masks through `environment_masks`; SAM never confirms environment automatically. Rerunning segmentation returns a new result, leaves source geometry unchanged, and requires downstream association/label invalidation once those stages exist. Shared predictors have mutable image state; serialize access to a wrapper. Run the contract suite with `python -m unittest discover -s tests -p 'test_*seg*.py' -v`.
+
+For combined segmentation and diffusion, application startup owns one shared Hydra session (`pipeline_kwargs` contains the caller's generation settings):
+
+```python
+from cosmos_predict1.utils.model_config import model_config_session
+from cosmos_predict1.diffusion.inference.gen3c_pipeline import Gen3cPipeline
+
+with model_config_session(sam_config="configs/sam2.1/sam2.1_hiera_l.yaml"):
+    segmenter = SAM21Segmenter.from_checkpoint("checkpoints/sam2.1_hiera_large.pt")
+    pipeline = Gen3cPipeline(**pipeline_kwargs)
+    # Run segmentation, conditioning, and generation here.
+```
+
+GEN3C registers its runtime root under `_cosmos_predict1_runtime_config`, preserving a caller's root named `config`. Configuration registration/composition must be serialized; the helper never resets caller-owned Hydra state. A caller-owned session must already expose the requested SAM config (normally through `pkg://sam2`). Manual lifecycle checks covered shared startup, prior normal SAM import, repeated composition, construction failure, and incompatible caller sessions. No additional test files were added.
 
 ### 3. Match views geometrically
 
@@ -148,6 +163,7 @@ Current status: integration pending. Use SAM's video predictor instead of implem
 Requirements:
 
 - Build one `SAM2VideoPredictor` session per source camera using `build_sam2_video_predictor()` with the SAM 2.1 checkpoint/configuration. Export prepared frames in chronological order and preserve the mapping from SAM's zero-based frame offsets to original observation keys.
+- Construct video predictors within the same application-owned `model_config_session()` used by the image and diffusion loaders; do not introduce another Hydra initializer or clear caller state.
 - Seed objects from selected automatic/image masks with `add_new_mask()`, or from GUI clicks/boxes with `add_new_points_or_box()`. Assign distinct session object IDs; propagate masks using `propagate_in_video()` and threshold output logits at zero.
 - Store native IDs as tracks scoped by `(source_id, view_id, session_id, obj_id)`. Map tracks and accepted cross-view links into canonical IDs in step 5; the same numeric ID from two sessions does not imply the same object.
 - Add newly discovered/user-selected objects as new SAM seeds. Apply corrections through SAM's APIs and rerun affected propagation. A lost/split track remains unresolved until supported association or GUI confirmation; add no separate learned reidentification model. The pinned revision includes the December 2024 predictor update supporting new objects after propagation starts; do not substitute an older September-only checkout.

@@ -408,14 +408,11 @@ class SAM21Segmenter:
         if options.get("output_mode", "binary_mask") != "binary_mask":
             raise ValueError("SAM21Segmenter requires output_mode='binary_mask'")
         options["output_mode"] = "binary_mask"
-        from hydra import initialize_config_module
-        from hydra.core.global_hydra import GlobalHydra
+        from cosmos_predict1.utils.model_config import model_config_session
 
-        if GlobalHydra.instance().is_initialized():
-            raise RuntimeError("Construct SAM models outside an active Hydra session; caller state is preserved")
-        # Enter before the first sam2 import: SAM otherwise initializes Hydra
-        # globally in __init__.py. Re-enter for every build, even if SAM is cached.
-        with initialize_config_module("sam2", version_base="1.2"):
+        # Reuse the application's session, including a prior normal import sam2.
+        # For standalone calls, the helper scopes initialization before imports.
+        with model_config_session(sam_config=SAM21_MODELS[model_size][0]):
             try:
                 from sam2.build_sam import build_sam2
                 from sam2.sam2_image_predictor import SAM2ImagePredictor

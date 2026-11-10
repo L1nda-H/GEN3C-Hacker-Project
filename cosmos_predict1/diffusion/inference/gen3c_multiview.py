@@ -25,6 +25,7 @@ from cosmos_predict1.diffusion.inference.inference_utils import (
 )
 from cosmos_predict1.diffusion.inference.gen3c_pipeline import Gen3cPipeline
 from cosmos_predict1.utils import log, misc
+from cosmos_predict1.utils.model_config import model_config_session
 from cosmos_predict1.utils.io import read_prompts_from_file, save_video
 from cosmos_predict1.diffusion.inference.cache_3d import Cache3D_BufferSelector
 import torch.nn.functional as F
@@ -356,4 +357,6 @@ if __name__ == "__main__":
         args.prompt = ""
     args.disable_guardrail = True
     args.disable_prompt_upsampler = True
-    demo(args)
+    # One application-owned configuration session serves SAM and diffusion.
+    with model_config_session(sam_config="configs/sam2.1/sam2.1_hiera_l.yaml"):
+        demo(args)
