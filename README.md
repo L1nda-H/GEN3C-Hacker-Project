@@ -231,6 +231,18 @@ CUDA_HOME=$CONDA_PREFIX PYTHONPATH=$(pwd) torchrun --nproc_per_node=${NUM_GPUS} 
 ```
 
 
+## Composite cache: step 6 requirements
+
+Attach step-5 labels to existing cache points and render selected objects from one source. See the [implementation plan](docs/CACHE3D_COMPOSITE_IMPLEMENTATION_PLAN.md). This step is pending.
+
+1. **Pack aligned labels.** Accept a `LabeledSource` (including a reloaded result) and pack its label maps in `PreparedSource.cache_keys` order alongside RGB and geometry validity. Preserve frame/view mapping; static source views remain on `N`. Validate alignment before cache construction.
+2. **Store labels separately.** Add optional `input_labels` to `Cache3D_Base`. Normalize using the RGB `input_format`, with one label channel, to CPU `int64 [B,F,N,V,1,H,W]`. Reject noninteger labels, values below `-1`, and mismatched shapes. Label `(y,x)` belongs to point `(y,x)`; retain existing unprojection and geometry filtering.
+3. **Filter at render time.** Add optional `selected_ids` to `render_cache()` and its overrides. `None` preserves existing rendering; an empty selection renders no coverage. Otherwise combine label membership with geometry validity before warping RGB or depth. Allow `0` for confirmed environment; exclude `-1` from explicit selections. Keep stored geometry/masks and output tensor shapes unchanged; never interpolate numeric IDs.
+4. **Forward selection consistently.** Pass selection through `Cache3D_Buffer`, `Cache3D_BufferSelector`, and `Cache4D`. Rank buffer views after filtering; disable the selector's near-full-view shortcut for explicit selections so it cannot suppress other selected objects.
+5. **Wire optional inputs.** Pass aligned labels through `gen3c_multiview.demo()` and `Gen3cPersistentModel.seed_model_from_values()`. Existing unlabeled callers must continue to work. Keep the current RGB/coverage conditioning contract.
+6. **Keep buffer updates aligned.** If a labeled cache accepts an update, insert/replace its labels together with RGB, points, and validity. Require aligned `new_labels` in that path; reject unlabeled updates before mutation. Generated-frame association remains later work.
+7. **Verify on CPU.** Check point/label alignment, frame/view packing, large integer IDs, geometry-mask intersection, empty/environment/object selections, override forwarding, and buffer insert/replace behavior. Verify unlabeled rendering remains unchanged. Completion: one image or single-camera clip renders only the selected object's valid points. Cross-source placement/fusion, multiview association, and GUI controls are later stages.
+
 ## Gallery
 
 - **GEN3C** can be easily applied to video/scene creation from a single image
