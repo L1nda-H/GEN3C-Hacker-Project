@@ -1,5 +1,15 @@
 # Cache3D_Composite implementation plan
 
+## Next milestone: static single-image composition
+
+The next implementation stages are planned, not implemented. For this MVP, use these ordered plans; their narrower scope defers timelines and confidence blending:
+
+1. [Composite cache and placement](../COMPOSITE_CACHE_AND_PLACEMENT_PLAN.md)
+2. [Composite rendering and fusion](../COMPOSITE_RENDERING_AND_FUSION_PLAN.md)
+3. [Gen3C integration and MVP validation](../COMPOSITE_GEN3C_INTEGRATION_PLAN.md)
+
+The existing image/video labeling work below remains a prerequisite. The broader multiview/video requirements remain the later roadmap.
+
 ## Qualities
 - Use [SAM 2.1](https://github.com/facebookresearch/sam2) for all instance segmentation and video mask propagation.
 - Wrap existing single-view, multiview, and dynamic caches; preserve each source's views and frames.

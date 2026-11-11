@@ -233,7 +233,7 @@ CUDA_HOME=$CONDA_PREFIX PYTHONPATH=$(pwd) torchrun --nproc_per_node=${NUM_GPUS} 
 
 ## Composite cache: step 6 requirements
 
-Attach step-5 labels to existing cache points and render selected objects from one source. See the [implementation plan](docs/CACHE3D_COMPOSITE_IMPLEMENTATION_PLAN.md). This step is pending.
+Attach step-5 labels to existing cache points and render selected objects from one source. See the [implementation plan](docs/finished/CACHE3D_COMPOSITE_IMPLEMENTATION_PLAN.md). This step is pending.
 
 1. **Pack aligned labels.** Accept a `LabeledSource` (including a reloaded result) and pack its label maps in `PreparedSource.cache_keys` order alongside RGB and geometry validity. Preserve frame/view mapping; static source views remain on `N`. Validate alignment before cache construction.
 2. **Store labels separately.** Add optional `input_labels` to `Cache3D_Base`. Normalize using the RGB `input_format`, with one label channel, to CPU `int64 [B,F,N,V,1,H,W]`. Reject noninteger labels, values below `-1`, and mismatched shapes. Label `(y,x)` belongs to point `(y,x)`; retain existing unprojection and geometry filtering.

@@ -30,7 +30,7 @@
 - Select objects from different sources and designate one environment source.
 - Wrap source caches in `Cache3D_Composite` while preserving source views and frames.
 - Store object selections, placement transforms, and time mappings separately from source geometry.
-- Follow the [Cache3D composite implementation plan](CACHE3D_COMPOSITE_IMPLEMENTATION_PLAN.md) for implementation details.
+- Follow the [Cache3D composite implementation plan](finished/CACHE3D_COMPOSITE_IMPLEMENTATION_PLAN.md) for implementation details.
 
 ## Alignment and scale calibration
 
