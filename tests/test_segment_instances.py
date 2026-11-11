@@ -1,6 +1,7 @@
 """Mocked checks of the official SAM image API boundary, without model downloads."""
 
 import sys
+import hashlib
 import tempfile
 import types
 import unittest
@@ -14,6 +15,7 @@ import torch
 from cosmos_predict1.diffusion.inference.instance_segmentation import (
     InstanceObservation,
     SAM21_MODELS,
+    SAM21_REVISION,
     SAM21Segmenter,
     SegmentPrompts,
     SourceObservation,
@@ -282,6 +284,11 @@ class SAM21SegmenterTests(unittest.TestCase):
             predictor_cls.assert_called_once_with(model)
             generator_cls.assert_called_once_with(model, output_mode='binary_mask', **options)
             self.assertIs(result.predictor, predictor_cls.return_value)
+            self.assertEqual(result.provenance.sam_revision, SAM21_REVISION)
+            self.assertEqual(result.provenance.configuration, SAM21_MODELS['small'][0])
+            self.assertEqual(result.provenance.checkpoint_sha256, hashlib.sha256(b'').hexdigest())
+            self.assertEqual(result.provenance.settings['automatic_mask_options'],
+                             dict(options, output_mode='binary_mask'))
             self.assertNotIn('output_mode', options)
             with self.assertRaisesRegex(ValueError, 'output_mode'):
                 SAM21Segmenter.from_checkpoint(checkpoint, automatic_mask_options={'output_mode': 'coco_rle'})

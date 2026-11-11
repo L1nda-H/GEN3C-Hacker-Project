@@ -1,9 +1,11 @@
 """Align and segment source observations without assigning cross-image identities."""
 
+import hashlib
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping, Sequence
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -34,6 +36,7 @@ class PreparedSource:
     """Camera-Z observations with pre-sanitization geometry validity."""
 
     observations: Mapping[ObservationKey, SourceObservation]
+    preparation: Mapping = field(default_factory=dict)
 
     def cache_kwargs(self) -> dict:
         """Pack sorted frames/views as F,N,C,H,W for Cache3D_Base.
@@ -218,7 +221,8 @@ def prepare_source(
             k[0, 2] += (sx - 1) / 2
             k[1, 2] += (sy - 1) / 2
         prepared[key] = SourceObservation(rgb, depth, k, obs.w2c, valid, labels)
-    return PreparedSource(prepared)
+    return PreparedSource(prepared, dict(crop=crop, output_size=output_size,
+                                         is_depth=is_depth, camera_convention=camera_convention))
 
 
 # requirements.txt pins the implementation used by these APIs.
@@ -229,6 +233,33 @@ SAM21_MODELS = {
     "base_plus": ("configs/sam2.1/sam2.1_hiera_b+.yaml", "sam2.1_hiera_base_plus.pt"),
     "large": ("configs/sam2.1/sam2.1_hiera_l.yaml", "sam2.1_hiera_large.pt"),
 }
+
+
+def file_sha256(path: str | Path) -> str:
+    """Hash a checkpoint once at loading, or a saved artifact at persistence."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class ModelProvenance:
+    sam_revision: str
+    configuration: str
+    checkpoint_sha256: str
+    settings: Mapping = field(default_factory=dict)
+
+    def __post_init__(self):
+        if not all(isinstance(value, str) and value for value in (self.sam_revision, self.configuration)):
+            raise ValueError("Model provenance requires a revision and configuration")
+        if (not isinstance(self.checkpoint_sha256, str) or len(self.checkpoint_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in self.checkpoint_sha256)):
+            raise ValueError("Checkpoint SHA-256 must be a lowercase hexadecimal digest")
+
+    def with_settings(self, **settings):
+        return replace(self, settings={**self.settings, **settings})
 
 
 @dataclass(frozen=True)
@@ -291,18 +322,23 @@ class SegmentedObservation:
     Consumers must exclude ambiguous_mask before rasterizing instance labels.
     unassigned_mask excludes candidates, ambiguity, and confirmed environment.
     Confirmed environment must still intersect geometry validity in step 5.
+    confirmed_environment_mask retains the original user confirmation for editing.
     """
 
     instances: tuple[InstanceObservation, ...]
     ambiguous_mask: torch.Tensor
     unassigned_mask: torch.Tensor
     environment_mask: torch.Tensor
+    # Preserve user confirmation before candidate/ambiguity/geometry filtering.
+    confirmed_environment_mask: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
 class SegmentedSource:
     prepared_source: PreparedSource
     observations: Mapping[ObservationKey, SegmentedObservation]
+    revision: str = field(default_factory=lambda: uuid4().hex)
+    provenance: ModelProvenance | None = None
 
 
 def _sam_rgb(rgb: torch.Tensor, rgb_range: tuple[float, float]) -> np.ndarray:
@@ -388,9 +424,10 @@ class SAM21Segmenter:
     Instances have mutable predictor state: serialize calls to a shared wrapper.
     """
 
-    def __init__(self, predictor, automatic_mask_generator=None):
+    def __init__(self, predictor, automatic_mask_generator=None, *, provenance=None):
         self.predictor = predictor
         self.automatic_mask_generator = automatic_mask_generator
+        self.provenance = provenance
 
     @classmethod
     def from_checkpoint(cls, checkpoint_path: str | Path, *, model_size="large", device="cuda",
@@ -422,7 +459,10 @@ class SAM21Segmenter:
                     raise ImportError("Install SAM 2.1 with pip install -r requirements.txt") from exc
                 raise
             model = build_sam2(SAM21_MODELS[model_size][0], str(checkpoint_path), device=device, mode="eval")
-            return cls(SAM2ImagePredictor(model), SAM2AutomaticMaskGenerator(model, **options))
+            return cls(SAM2ImagePredictor(model), SAM2AutomaticMaskGenerator(model, **options),
+                       provenance=ModelProvenance(SAM21_REVISION, SAM21_MODELS[model_size][0],
+                                                  file_sha256(checkpoint_path),
+                                                  dict(automatic_mask_options=options)))
 
     @torch.inference_mode()
     def segment(self, rgb: torch.Tensor, *, rgb_range: tuple[float, float],
@@ -493,7 +533,10 @@ def segment_source(
         results[key] = _segmented_observation(
             key, observation, prediction.proposals, environment_masks.get(key), boundary_width,
         )
-    return SegmentedSource(source, results)
+    provenance = segmenter.provenance
+    if provenance is not None:
+        provenance = provenance.with_settings(mode="image", rgb_range=rgb_range, boundary_width=boundary_width)
+    return SegmentedSource(source, results, provenance=provenance)
 
 
 def _segmented_observation(key, observation, proposals, environment=None, boundary_width=0):
@@ -517,6 +560,7 @@ def _segmented_observation(key, observation, proposals, environment=None, bounda
     environment = empty if environment is None else environment
     if environment.dtype != torch.bool or environment.shape != empty.shape or environment.device != empty.device:
         raise ValueError("Confirmed environment must be boolean [H,W] on the prepared RGB device")
+    confirmed_environment = environment.clone()
     environment = environment & ~occupied & ~ambiguous
     return SegmentedObservation(tuple(instances), ambiguous,
-                                ~occupied & ~ambiguous & ~environment, environment)
+                                ~occupied & ~ambiguous & ~environment, environment, confirmed_environment)

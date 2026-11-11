@@ -16,7 +16,7 @@
 
 ## Step 1: segmentation, matching, and labeling
 
-Status: input alignment and the SAM 2.1 image wrapper/checkpoint loader are implemented. The video wrapper is implemented with mocked API validation. Real-checkpoint accuracy validation, GUI integration, geometric association, persistence, and cache label attachment remain pending. The geometric snippet below remains a partial integration sketch.
+Status: input alignment, SAM 2.1 image/video wrappers, canonical labeling, and editable persistence are implemented with local contract tests. Real-checkpoint accuracy validation, GUI integration, geometric association, and cache label attachment remain pending. The geometric snippet below remains a partial integration sketch.
 
 **MVP order:** temporarily skip step 3. Single images follow steps 1 → 2 → 5 → 6; single-camera videos follow steps 1 → 2 (object seeding) → 4 → 5 → 6. Sources retain independent object-ID namespaces when combined in the composite.
 
@@ -262,11 +262,26 @@ Step 5 should turn a `SegmentedSource` into persistent object identities and int
    - **JSON:** schema version, source ID, object names, observation/track bindings, merge aliases, optional quality scores, segmentation revision, SAM revision/configuration, and checkpoint SHA-256.
    - Validate shapes, integer values, referenced IDs, and prepared-source alignment when loading. Sparse frame keys must survive unchanged.
    - **Source-alignment validation** checks that saved labels belong to the exact prepared inputs being loaded. Observation keys locate frames/views; a prepared-source fingerprint checks input identity, crop/resize settings, depth, and camera metadata. Matching shapes and frame keys alone cannot distinguish two clips or detect changed pixel alignment. Store and verify this fingerprint before attaching labels to points.
-   - **Reload** means reopening saved results, for example after an application restart. For cache loading/rendering, label maps, validity, and registry metadata are sufficient when the matching prepared source is available. To resume **editing** (correcting object masks or prompts), also persist the original RGB-grid object masks and ambiguity masks, or explicitly require resegmentation. Final point labels cannot reconstruct object-mask pixels excluded by invalid depth. Saving masks preserves editable segmentation data; resuming SAM video inference additionally requires reinitializing and seeding the predictor.
+   - **Reload** means reopening saved results, for example after an application restart. For cache loading/rendering, label maps, validity, and registry metadata are sufficient when the matching prepared source is available. To resume **editing** (correcting object masks or prompts), also persist the original RGB-grid object masks, ambiguity masks, and confirmed environment masks, or explicitly require resegmentation. Confirmed environment masks record the user's acceptance of environment pixels before geometry/ambiguity filtering; final labels cannot recover confirmations or object-mask pixels excluded by invalid depth or ambiguity. Saving masks preserves editable segmentation data; resuming SAM video inference additionally requires reinitializing and seeding the predictor.
 
-Two small supporting changes are needed: add a segmentation revision to identify each result snapshot, and carry model provenance from the image/video loaders. The current results contain neither.
+Current status: `instance_labeling.py` implements `ObjectRegistry`, `label_source()`, and NPZ/JSON save/load. Image/video results carry a fresh segmentation revision; checkpoint loaders record SAM revision/configuration and compute the checkpoint hash once. Injected predictors may explicitly leave provenance unknown (`None`). Original environment confirmations are retained separately from the filtered environment mask. Source fingerprints include prepared RGB/depth/cameras/validity and preparation settings, excluding existing labels.
+
+```python
+from cosmos_predict1.diffusion.inference.instance_labeling import (
+    label_source, save_labeled_source, load_labeled_source,
+)
+
+labeled = label_source(segmented, source_id="clip-a")  # Must match video track source_id.
+save_labeled_source("outputs/clip-a", labeled)  # Creates .npz and .json siblings.
+loaded = load_labeled_source("outputs/clip-a", segmented.prepared_source)
+updated = label_source(corrected_segmented, source_id="clip-a", registry=loaded.registry)
+```
+
+`label_source()` copies the supplied registry and creates new label maps; prior results remain unchanged. For image corrections or a restarted video session, pass explicit `identity_links={(frame_idx, view_id, local_id): canonical_id}` to retain a confirmed identity. Bindings otherwise carry across revisions only through the same scoped video track. Changed masks or confirmation/uncertainty data require a new `SegmentedSource` revision; reusing a revision with changed content is rejected. After `registry.merge_ids(retired_id, surviving_id)`, rerun `label_source()` on each affected snapshot using the merged registry. Saving rejects stale maps, and loading verifies the source fingerprint, NPZ/JSON pairing, registry references, shapes/dtypes, and rasterization semantics. All saves include masks for editing; SAM runtime state and source RGB/depth/cameras are supplied separately.
 
 Tests should cover deterministic allocation, independent source/session namespaces, disappearance/reappearance, corrections and merges, overlap/environment rules, missing depth, sparse keys, exact save/load preservation, and rejection of mismatched metadata.
+
+Verification: 52 CPU tests pass, including image/video API contracts, tracking-to-label persistence, large integer IDs, and environment confirmations at pixels excluded from final labels. Run `python -m unittest discover -s tests -v`. Real-checkpoint mask accuracy remains a CUDA validation task.
 
 The deliverable is a registry plus reloadable label maps ready for step 6.
 

@@ -9,7 +9,8 @@ from PIL import Image
 import torch
 
 from cosmos_predict1.diffusion.inference.instance_segmentation import (
-    SAM21_MODELS, InstanceProposal, PreparedSource, SegmentedSource, SegmentPrompts,
+    SAM21_MODELS, SAM21_REVISION, InstanceProposal, ModelProvenance, PreparedSource, SegmentedSource, SegmentPrompts,
+    file_sha256,
     _sam_mask, _sam_prompts, _sam_rgb, _segmented_observation,
 )
 
@@ -22,8 +23,9 @@ class SAM21VideoSegmenter:
     labels/render masks must be rebuilt from that snapshot (steps 5/6).
     """
 
-    def __init__(self, predictor):
+    def __init__(self, predictor, *, provenance=None):
         self.predictor = predictor
+        self.provenance = provenance
         self._lock = RLock()
         self.state = None
         self.result = None
@@ -45,7 +47,7 @@ class SAM21VideoSegmenter:
                 raise
             return cls(build_sam2_video_predictor(
                 SAM21_MODELS[model_size][0], str(checkpoint_path), device=device, mode="eval",
-            ))
+            ), provenance=ModelProvenance(SAM21_REVISION, SAM21_MODELS[model_size][0], file_sha256(checkpoint_path)))
 
     @torch.inference_mode()
     def initialize(self, source: PreparedSource, *, source_id: str, rgb_range: tuple[float, float]):
@@ -70,6 +72,7 @@ class SAM21VideoSegmenter:
                     )
                 state = self.predictor.init_state(video_path=directory, async_loading_frames=False)
             self.source, self.source_id = source, source_id
+            self._rgb_range = tuple(rgb_range)
             self.frame_keys = keys
             self._offsets = {key: offset for offset, key in enumerate(keys)}
             self.session_id = uuid4().hex
@@ -185,5 +188,9 @@ class SAM21VideoSegmenter:
                 results[key] = _segmented_observation(
                     key, obs, proposals, environment_masks.get(key), boundary_width,
                 )
-            self.result = SegmentedSource(self.source, results)
+            provenance = self.provenance
+            if provenance is not None:
+                provenance = provenance.with_settings(mode="video", rgb_range=self._rgb_range,
+                                                       boundary_width=boundary_width)
+            self.result = SegmentedSource(self.source, results, provenance=provenance)
             return self.result

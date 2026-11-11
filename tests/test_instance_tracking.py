@@ -1,6 +1,7 @@
 """Contract tests for the pinned SAM public video API; no weights required."""
 
 import sys
+import hashlib
 import tempfile
 import types
 import unittest
@@ -12,9 +13,10 @@ from PIL import Image
 import torch
 
 from cosmos_predict1.diffusion.inference.instance_segmentation import (
-    InstanceObservation, SAM21_MODELS, SegmentPrompts, SourceObservation, prepare_source,
+    InstanceObservation, SAM21_MODELS, SAM21_REVISION, SegmentPrompts, SourceObservation, prepare_source,
 )
 from cosmos_predict1.diffusion.inference.instance_tracking import SAM21VideoSegmenter
+from cosmos_predict1.diffusion.inference.instance_labeling import label_source, load_labeled_source, save_labeled_source
 
 
 def source(keys=((20, 7), (2, 7), (90, 7))):
@@ -126,6 +128,7 @@ class VideoTrackingTests(unittest.TestCase):
         self.assertEqual(predictor.calls[-2:], [(1, False), (2, True)])
         self.assertEqual(second.observations[2, 7].instances[0].track_id, old_track)
         self.assertEqual(len(second.observations[2, 7].instances), 2)
+        self.assertNotEqual(first.revision, second.revision)
         torch.testing.assert_close(second.observations[2, 7].instances[0].mask, corrected)
         self.assertTrue(first.observations[2, 7].instances[0].mask.all())
         self.assertEqual(second.observations[2, 7].instances[0].name, 'Renamed')
@@ -193,10 +196,34 @@ class VideoTrackingTests(unittest.TestCase):
             tracker = SAM21VideoSegmenter.from_checkpoint(checkpoint.name, model_size='small')
             build.assert_called_once_with(SAM21_MODELS['small'][0], checkpoint.name, device='cuda', mode='eval')
             self.assertIs(tracker.predictor, build.return_value)
+            self.assertEqual(tracker.provenance.sam_revision, SAM21_REVISION)
+            self.assertEqual(tracker.provenance.configuration, SAM21_MODELS['small'][0])
+            self.assertEqual(tracker.provenance.checkpoint_sha256, hashlib.sha256(b'').hexdigest())
         with self.assertRaises(ValueError):
             SAM21VideoSegmenter.from_checkpoint('unused', model_size='unknown')
         with self.assertRaises(FileNotFoundError):
             SAM21VideoSegmenter.from_checkpoint('/missing/checkpoint.pt')
+
+    def test_tracking_labeling_reload_and_correction_keep_canonical_id(self):
+        tracker, _, prepared = self.initialized()
+        # Keep missing depth elsewhere; one frame supplies labeled foreground points.
+        prepared.observations[2, 7].depth[:] = 1
+        prepared.observations[2, 7].geometry_mask[:] = True
+        tracker.seed_objects((2, 7), [seed((2, 7), 42, name='Cup')])
+        first = label_source(tracker.propagate(), source_id='scene')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'labels'
+            save_labeled_source(path, first)
+            loaded = load_labeled_source(path, prepared)
+            corrected = torch.zeros(4, 6, dtype=torch.bool)
+            corrected[:, 3:] = True
+            tracker.correct_object((2, 7), seed((2, 7), 42, corrected, 'Cup'))
+            updated = label_source(tracker.propagate(), source_id='scene', registry=loaded.registry)
+            self.assertEqual(updated.registry.track_to_id, first.registry.track_to_id)
+            self.assertEqual(len(updated.registry.names), 1)
+            self.assertTrue((updated.labels[2, 7][:, 3:] == 1).all())
+            self.assertTrue((updated.labels[2, 7][:, :3] == -1).all())
+            self.assertTrue((loaded.labels[2, 7] == 1).all())
 
 
 if __name__ == '__main__':
