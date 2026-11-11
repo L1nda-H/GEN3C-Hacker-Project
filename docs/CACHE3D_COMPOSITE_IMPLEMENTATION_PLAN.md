@@ -232,19 +232,39 @@ for frame_offset, object_ids, mask_logits in video.propagate_in_video(state):
 ```
 
 ### 5. Assign canonical labels and persist
-Implement `ObjectRegistry` with `allocate()`, `bind_observation()`, and `merge_ids()`; allocate positive IDs within each source and preserve observation-to-ID mappings. Track merges/corrections update all affected maps; names are user-supplied or generic. Rasterize accepted disjoint masks; reserve `0` for confirmed, valid, unambiguous environment pixels and `-1` for unresolved/invalid regions. Persist integer maps and validity in NPZ, and names, optional quality scores, observations, ID mappings, SAM code revision, configuration, and checkpoint hash in JSON.
 
-```python
-# Rasterize one image; `observations` contains only its instance masks.
-labels = torch.full(valid.shape, -1, dtype=torch.int64)
-labels[valid & environment_mask & ~uncertain] = 0
-for obs in observations:
-    key = (obs.frame_idx, obs.view_id, obs.local_id)
-    instance_id = observation_to_id.get(key)
-    if instance_id is not None:
-        labels[valid & obs.mask & ~uncertain] = instance_id
-# `environment_mask` is confirmed and excludes candidates; uncertainty includes conflicts.
-```
+Step 5 should turn a `SegmentedSource` into persistent object identities and integer label maps. It can work directly with single images and single-camera tracks while step 3 stays deferred.
+
+1. **Add `ObjectRegistry` in `instance_labeling.py`.**
+   - `allocate(name)` creates a positive canonical ID within one source.
+   - `bind_observation((frame_idx, view_id, local_id), instance_id)` records identity.
+   - Map each scoped video `track_id` to one canonical ID across frames, including empty masks.
+   - Treat still-image candidates independently; matching local IDs across images/sessions do not establish identity.
+   - `merge_ids()` redirects bindings to a surviving ID. Never reuse retired IDs.
+
+2. **Rasterize labels using existing masks.**
+   - Start with an `int64 [H,W]` map filled with `-1`.
+   - Assign `0` only to confirmed, geometry-valid, unambiguous environment.
+   - Assign positive IDs only where the bound object mask is valid and unambiguous.
+   - Leave overlaps, uncertain boundaries, unassigned regions, and invalid geometry at `-1`.
+   - Preserve geometry validity separately and keep the original RGB masks unchanged.
+
+3. **Support corrections without losing identity.**
+   - Accept the previous registry when labeling a corrected tracking result.
+   - Preserve canonical IDs for unchanged scoped tracks; allocate IDs for new tracks.
+   - Rebuild label maps after corrections or merges.
+   - Require explicit identity preservation for still-image rediscovery, whose automatic IDs may change.
+
+4. **Persist and reload the result.**
+   - **NPZ:** label maps and geometry validity, keyed through an explicit observation manifest.
+   - **JSON:** schema version, source ID, object names, observation/track bindings, merge aliases, optional quality scores, segmentation revision, SAM revision/configuration, and checkpoint SHA-256.
+   - Validate shapes, integer values, referenced IDs, and prepared-source alignment when loading. Sparse frame keys must survive unchanged.
+
+Two small supporting changes are needed: add a segmentation revision to identify each result snapshot, and carry model provenance from the image/video loaders. The current results contain neither.
+
+Tests should cover deterministic allocation, independent source/session namespaces, disappearance/reappearance, corrections and merges, overlap/environment rules, missing depth, sparse keys, exact save/load preservation, and rejection of mismatched metadata.
+
+The deliverable is a registry plus reloadable label maps ready for step 6.
 
 ### 6. Attach to cache points and check consistency
 Add label-loading arguments at cache construction in `gen3c_multiview.demo()` and `Gen3cPersistentModel.seed_model_from_values()`. Normalize labels with the same dimension mapping as RGB into `[B, F, N, V, 1, H, W]`; the static multiview path stores source views along `N`. In `Cache3D_Base.__init__()`, store them as `int64`, separate from `input_mask`. Pixel `(y, x)` labels `input_points[..., y, x, :]` directly, so unprojection mathematics stays unchanged. Keep separate view samples carrying the same canonical ID.
