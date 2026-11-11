@@ -254,11 +254,15 @@ Step 5 should turn a `SegmentedSource` into persistent object identities and int
    - Preserve canonical IDs for unchanged scoped tracks; allocate IDs for new tracks.
    - Rebuild label maps after corrections or merges.
    - Require explicit identity preservation for still-image rediscovery, whose automatic IDs may change.
+   - **Rediscovery** means rerunning automatic image segmentation: local ID `3` may now identify a different object. A **new video session** means initializing the tracker again, which creates a fresh track-ID namespace even for the same clip.
+   - A **segmentation revision** uniquely identifies one result snapshot; changed masks produce a new revision. Scope observation bindings to that revision so reused `(frame_idx, view_id, local_id)` keys cannot silently inherit an old identity. Across revisions, preserve identities through unchanged scoped tracks or explicit confirmation.
 
 4. **Persist and reload the result.**
    - **NPZ:** label maps and geometry validity, keyed through an explicit observation manifest.
    - **JSON:** schema version, source ID, object names, observation/track bindings, merge aliases, optional quality scores, segmentation revision, SAM revision/configuration, and checkpoint SHA-256.
    - Validate shapes, integer values, referenced IDs, and prepared-source alignment when loading. Sparse frame keys must survive unchanged.
+   - **Source-alignment validation** checks that saved labels belong to the exact prepared inputs being loaded. Observation keys locate frames/views; a prepared-source fingerprint checks input identity, crop/resize settings, depth, and camera metadata. Matching shapes and frame keys alone cannot distinguish two clips or detect changed pixel alignment. Store and verify this fingerprint before attaching labels to points.
+   - **Reload** means reopening saved results, for example after an application restart. For cache loading/rendering, label maps, validity, and registry metadata are sufficient when the matching prepared source is available. To resume **editing** (correcting object masks or prompts), also persist the original RGB-grid object masks and ambiguity masks, or explicitly require resegmentation. Final point labels cannot reconstruct object-mask pixels excluded by invalid depth. Saving masks preserves editable segmentation data; resuming SAM video inference additionally requires reinitializing and seeding the predictor.
 
 Two small supporting changes are needed: add a segmentation revision to identify each result snapshot, and carry model provenance from the image/video loaders. The current results contain neither.
 
