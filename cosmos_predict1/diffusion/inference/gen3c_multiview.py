@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import argparse
+import json
 import os
 import cv2
 import torch
@@ -28,6 +29,7 @@ from cosmos_predict1.utils import log, misc
 from cosmos_predict1.utils.model_config import model_config_session
 from cosmos_predict1.utils.io import read_prompts_from_file, save_video
 from cosmos_predict1.diffusion.inference.cache_3d import Cache3D_BufferSelector
+from cosmos_predict1.diffusion.inference.instance_labeling import load_cache_label_kwargs
 import torch.nn.functional as F
 torch.enable_grad(False)
 
@@ -100,6 +102,9 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="If set, use foreground masking for the warped images.",
     )
+    parser.add_argument("--labels_path", help="Step-5 NPZ/JSON artifact prefix for these source observations")
+    parser.add_argument("--selected_ids", type=int, nargs="*", default=None,
+                        help="Canonical object IDs (0: environment); empty list selects nothing")
     return parser
 
 def parse_arguments() -> argparse.Namespace:
@@ -141,6 +146,9 @@ def demo(args):
     inference_type = "video2world"
     validate_args(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    selected_ids = getattr(args, 'selected_ids', None)
+    if selected_ids is not None and not getattr(args, 'labels_path', None):
+        raise ValueError("Object selection requires --labels_path")
 
     if args.num_gpus > 1:
         from megatron.core import parallel_state
@@ -212,7 +220,7 @@ def demo(args):
         input_w2c_bN44 = w2c_key.unsqueeze(0)        # [1, N, 4, 4]
         input_K_bN33 = K_key.unsqueeze(0)            # [1, N, 3, 3]
 
-        cache = Cache3D_BufferSelector(
+        cache_kwargs = dict(
             frame_buffer_max=frame_buffer_max,
             input_image=input_image_bNCHW,
             input_depth=input_depth_bN1HW,
@@ -223,6 +231,14 @@ def demo(args):
             input_format=["B", "N", "C", "H", "W"],
             foreground_masking=args.foreground_masking,
         )
+
+        if getattr(args, 'labels_path', None):
+            keys = tuple(map(tuple, npz['observation_keys'].tolist())) if 'observation_keys' in npz else None
+            preparation = json.loads(str(npz['preparation'].item())) if 'preparation' in npz else None
+            cache_kwargs.update(load_cache_label_kwargs(
+                args.labels_path, cache_kwargs, observation_keys=keys, preparation=preparation,
+            ))
+        cache = Cache3D_BufferSelector(**cache_kwargs)
 
         generated_w2cs = torch.tensor(w2cs_all_np, dtype=torch.float32, device=device)[:args.num_video_frames].unsqueeze(0)  # [1, T, 4, 4]
         if Ks_all_np is not None:
@@ -235,6 +251,7 @@ def demo(args):
         rendered_warp_images, rendered_warp_masks = cache.render_cache(
             generated_w2cs[:, 0:sample_n_frames],
             generated_intrinsics[:, 0:sample_n_frames],
+            selected_ids=selected_ids,
         )
 
         all_rendered_warps = []
@@ -267,6 +284,7 @@ def demo(args):
             rendered_warp_images, rendered_warp_masks = cache.render_cache(
                 current_segment_w2cs,
                 current_segment_intrinsics,
+                selected_ids=selected_ids,
             )
 
             if args.save_buffer:

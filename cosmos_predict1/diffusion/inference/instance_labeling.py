@@ -193,6 +193,9 @@ class LabeledSource:
     labels: dict[tuple[int, int], torch.Tensor]
     source_fingerprint: str
 
+    def cache_kwargs(self):
+        return self.prepared_source.cache_kwargs(labeled_source=self)
+
     @property
     def prepared_source(self):
         return self.segmented_source.prepared_source
@@ -287,18 +290,69 @@ def _load_registry(data):
     return registry
 
 
-def save_labeled_source(path: str | Path, result: LabeledSource):
-    """Save matching .npz/.json siblings, including masks needed for later editing.
-
-    Does not serialize SAM inference state or source RGB/depth/cameras. Loading
-    requires the exact matching PreparedSource; SAM editing restarts from masks.
-    """
+def check_labeled_source(result):
+    """Reject stale maps or mutated segmentation before saving/attaching them."""
     checked = label_source(result.segmented_source, source_id=result.registry.source_id, registry=result.registry)
     if (result.source_fingerprint != checked.source_fingerprint or result.registry != checked.registry
             or set(result.labels) != set(checked.labels)
             or any(result.labels[k].dtype != torch.int64 or not torch.equal(result.labels[k], checked.labels[k])
                    for k in checked.labels)):
         raise ValueError("Stale label maps; rebuild after merges, corrections, or source changes")
+
+
+def load_cache_label_kwargs(path, cache_kwargs, *, observation_keys=None, preparation=None):
+    """Load step-5 artifacts against the exact tensors used by an entry point.
+
+    Keys are frame-major, then N/V; defaults are (frame offset, view offset).
+    Exporters must retain original keys/preparation when they differ from these.
+    """
+    from cosmos_predict1.diffusion.inference.instance_segmentation import (
+        SourceObservation, _cache_layout,
+    )
+
+    fmt = cache_kwargs.get('input_format', ['B', 'C', 'H', 'W'])
+    rgb = _cache_layout(cache_kwargs['input_image'], fmt)
+    b, f, n, v, _, h, w = rgb.shape
+    if b != 1:
+        raise ValueError("A saved source requires one cache batch")
+    if observation_keys is None:
+        observation_keys = cache_kwargs.get('observation_keys')
+    keys = tuple(observation_keys) if observation_keys is not None else tuple(
+        (frame, view) for frame in range(f) for view in range(n * v)
+    )
+    if len(keys) != f * n * v or len(set(keys)) != len(keys):
+        raise ValueError("Observation keys must match the cache frame/view layout")
+    images = rgb.reshape(-1, 3, h, w)
+    depths = cache_kwargs['input_depth'].reshape(-1, h, w)
+    poses = cache_kwargs['input_w2c'].reshape(-1, 4, 4)
+    intrinsics = cache_kwargs['input_intrinsics'].reshape(-1, 3, 3)
+    mask = cache_kwargs.get('input_mask')
+    mask = torch.ones_like(depths, dtype=torch.bool) if mask is None else _cache_layout(mask, fmt).reshape(-1, h, w).bool()
+    valid = mask & torch.isfinite(depths) & (depths > 0)
+    settings = (dict(crop=None, output_size=None, is_depth=True, camera_convention="opencv")
+                if preparation is None else preparation)
+    prepared = PreparedSource({key: SourceObservation(images[i], depths[i], intrinsics[i], poses[i], valid[i])
+                               for i, key in enumerate(keys)}, preparation=settings)
+    labeled = load_labeled_source(path, prepared)
+    labels = torch.stack([labeled.labels[key] for key in keys]).reshape(f, n, v, 1, h, w).unsqueeze(0)
+    dims = ['B', 'F', 'N', 'V', 'C', 'H', 'W']
+    for dim in list(dims):
+        if dim not in fmt:
+            labels = labels.squeeze(dims.index(dim))
+            dims.remove(dim)
+    labels = labels.permute(*(dims.index(dim) for dim in fmt))
+    return dict(input_labels=labels, object_registry=labeled.registry, observation_keys=keys,
+                source_fingerprint=labeled.source_fingerprint,
+                segmentation_revision=labeled.segmented_source.revision)
+
+
+def save_labeled_source(path: str | Path, result: LabeledSource):
+    """Save matching .npz/.json siblings, including masks needed for later editing.
+
+    Does not serialize SAM inference state or source RGB/depth/cameras. Loading
+    requires the exact matching PreparedSource; SAM editing restarts from masks.
+    """
+    check_labeled_source(result)
     path = Path(path)
     arrays, manifest = {}, []
     for index, (key, obs) in enumerate(sorted(result.segmented_source.observations.items())):
@@ -375,3 +429,25 @@ def load_labeled_source(path: str | Path, prepared: PreparedSource) -> LabeledSo
     if any(not torch.equal(labels[key], checked.labels[key]) for key in labels):
         raise ValueError("Saved labels violate geometry, uncertainty, or registry bindings")
     return checked
+
+
+def label_overlays(result: LabeledSource, *, rgb_range, alpha=0.5):
+    """Return CPU uint8 CHW overlays; unresolved pixels retain their source RGB."""
+    from cosmos_predict1.diffusion.inference.instance_segmentation import _sam_rgb
+
+    if not 0 <= alpha <= 1:
+        raise ValueError("Overlay alpha must be between 0 and 1")
+    check_labeled_source(result)
+    overlays = {}
+    for key, labels in result.labels.items():
+        image = torch.from_numpy(_sam_rgb(result.prepared_source.observations[key].rgb, rgb_range)).permute(2, 0, 1).float()
+        labels = labels.cpu()
+        for instance_id in labels.unique().tolist():
+            if instance_id < 0:
+                continue
+            color = torch.tensor([96, 96, 96] if instance_id == 0 else
+                                 [64 + (instance_id * factor) % 192 for factor in (67, 131, 173)]).float()
+            selected = labels == instance_id
+            image[:, selected] = image[:, selected] * (1 - alpha) + color[:, None] * alpha
+        overlays[key] = image.round().to(torch.uint8)
+    return overlays

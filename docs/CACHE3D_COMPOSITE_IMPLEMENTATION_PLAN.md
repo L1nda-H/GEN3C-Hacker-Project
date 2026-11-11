@@ -16,7 +16,7 @@
 
 ## Step 1: segmentation, matching, and labeling
 
-Status: input alignment, SAM 2.1 image/video wrappers, canonical labeling, and editable persistence are implemented with local contract tests. Real-checkpoint accuracy validation, GUI integration, geometric association, and cache label attachment remain pending. The geometric snippet below remains a partial integration sketch.
+Status: input alignment, SAM 2.1 image/video wrappers, canonical labeling, and editable persistence are implemented with local contract tests. Cache label attachment and selected rendering are implemented. Real-checkpoint accuracy validation, GUI integration, and geometric association remain pending. The geometric snippet below remains a partial integration sketch.
 
 **MVP order:** temporarily skip step 3. Single images follow steps 1 → 2 → 5 → 6; single-camera videos follow steps 1 → 2 (object seeding) → 4 → 5 → 6. Sources retain independent object-ID namespaces when combined in the composite.
 
@@ -287,6 +287,8 @@ The deliverable is a registry plus reloadable label maps ready for step 6.
 
 ### 6. Attach to cache points and check consistency
 
+- **Status:** implemented; 63 CPU tests pass, including real warp checks and persistent seeding/continuation with mocked models. Full CUDA/SAM/diffusion validation remains pending.
+
 - **Wire inputs:** add label loading to `gen3c_multiview.demo()`, `Gen3cPersistentModel.seed_model_from_values()`, and `PreparedSource.cache_kwargs()`.
 - **Store labels:** normalize like RGB to CPU `int64 [B,F,N,V,1,H,W]`, separate from `input_mask`. Reject noninteger labels, values below `-1`, shape mismatches, and unregistered positive IDs. Never cast IDs through RGB/`weight_dtype` or interpolate them.
 - **Preserve alignment:** map observation keys to cache offsets; retain separate samples sharing an ID. Verify source fingerprints, use integer-safe nearest sampling for crop/resize, and label `input_points[...,y,x,:]` directly without changing unprojection.
@@ -298,3 +300,15 @@ The deliverable is a registry plus reloadable label maps ready for step 6.
 - **Limit MVP scope:** support images and single-camera clips; static observations use `N`, time uses `F`. Validate render windows and repeat static sources across target times. Defer `V > 1` rendering and two-view reprojection checks until step 3.
 - **Verify:** add basic `check_label_consistency()` for shape/dtype, registry, source/revision, and render validity. Test layouts, sparse keys/windows, invalid depth/filtering, large IDs, corrections/merges, selected-only RGB/depth coverage, buffer updates, save/load, and unlabeled compatibility.
 - **Deliver:** labeled points, maps, registry, and overlays; confirm environment coverage and stable video IDs through disappearance/reappearance.
+
+```python
+cache = Cache4D(**labeled.cache_kwargs(), device="cuda")  # Cache3D_Buffer also accepts image sources.
+rgb, coverage = cache.render_cache(target_w2cs, target_intrinsics, selected_ids=[1])
+counts = cache.check_label_consistency()  # Semantic and renderable point counts by ID.
+cache.replace_labels(corrected_labeled)  # Same source; updated registry/revision.
+overlays = label_overlays(corrected_labeled, rgb_range=(-1, 1))  # CPU uint8 CHW by observation key.
+```
+
+- **Entry points:** `gen3c_multiview --labels_path PREFIX --selected_ids 1 2`; persistent `seed_model_from_values(..., labels_path=PREFIX, observation_keys=keys, preparation=settings, selected_ids=[1])`.
+- **Loading:** artifacts must match the actual prepared cache grid, RGB/depth/cameras/validity and preparation settings. Demo NPZ files may supply `observation_keys` and a JSON-string `preparation`; defaults are `(0, view_offset)` for static views and unchanged camera-Z preparation. Persistent clips default to `(frame_offset, 0)`; single images use `(0, 0)`. Supply original sparse keys/settings when different. Single-image persistent labels must match MoGE's prepared outputs; mismatches are rejected rather than resized silently.
+- **Updates:** labeled persistent generation reuses source geometry across chunks. Explicit `Cache3D_Buffer.update_cache(..., new_labels=...)` requires associated, registered IDs and invalidates the original source attachment; subsequent corrections require rebuilding the cache from its source.

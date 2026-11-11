@@ -31,6 +31,19 @@ class SourceObservation:
     labels: torch.Tensor | None = None
 
 
+def _cache_layout(tensor, input_format):
+    """Normalize image-grid tensors without casting integer/categorical data."""
+    dims = ("B", "F", "N", "V", "C", "H", "W")
+    if (tensor.ndim != len(input_format) or len(set(input_format)) != len(input_format)
+            or set(input_format) - set(dims) or not {"C", "H", "W"} <= set(input_format)):
+        raise ValueError("input_format must uniquely name tensor dimensions including C,H,W")
+    tensor = tensor.permute(*(input_format.index(dim) for dim in dims if dim in input_format))
+    for index, dim in enumerate(dims):
+        if dim not in input_format:
+            tensor = tensor.unsqueeze(index)
+    return tensor
+
+
 @dataclass(frozen=True)
 class PreparedSource:
     """Camera-Z observations with pre-sanitization geometry validity."""
@@ -38,11 +51,11 @@ class PreparedSource:
     observations: Mapping[ObservationKey, SourceObservation]
     preparation: Mapping = field(default_factory=dict)
 
-    def cache_kwargs(self) -> dict:
+    def cache_kwargs(self, *, labeled_source=None) -> dict:
         """Pack sorted frames/views as F,N,C,H,W for Cache3D_Base.
 
         Requires a complete frame/view grid and common image size. The cache
-        adds B/V dimensions; labels stay in observations pending Step 6.
+        adds B/V dimensions. Supply a validated LabeledSource to attach labels.
         """
         frames = sorted({key[0] for key in self.observations})
         views = sorted({key[1] for key in self.observations})
@@ -66,7 +79,7 @@ class PreparedSource:
             stacked = torch.stack(tensors)
             return stacked.reshape(len(frames), len(views), *stacked.shape[1:])
 
-        return dict(
+        kwargs = dict(
             input_image=pack("rgb"),
             input_depth=pack("depth", channel=True),
             input_mask=pack("geometry_mask", channel=True),
@@ -74,7 +87,25 @@ class PreparedSource:
             input_w2c=pack("w2c"),
             input_format=["F", "N", "C", "H", "W"],
             is_depth=True,
+            observation_keys=keys,
         )
+        if labeled_source is not None:
+            from cosmos_predict1.diffusion.inference.instance_labeling import (
+                check_labeled_source, prepared_source_fingerprint,
+            )
+
+            check_labeled_source(labeled_source)
+            if prepared_source_fingerprint(self) != labeled_source.source_fingerprint:
+                raise ValueError("Labels do not match the prepared-source fingerprint")
+            kwargs.update(
+                input_labels=torch.stack([labeled_source.labels[key] for key in keys]).reshape(
+                    len(frames), len(views), 1, *observations[0].depth.shape,
+                ),
+                object_registry=labeled_source.registry,
+                source_fingerprint=labeled_source.source_fingerprint,
+                segmentation_revision=labeled_source.segmented_source.revision,
+            )
+        return kwargs
 
     @property
     def cache_keys(self) -> tuple[ObservationKey, ...]:

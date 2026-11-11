@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from copy import deepcopy
+
 import torch
 from einops import rearrange
 
@@ -22,6 +24,27 @@ from cosmos_predict1.diffusion.inference.forward_warp_utils_pytorch import (
     unproject_points,
 )
 from cosmos_predict1.diffusion.inference.camera_utils import align_depth
+
+from cosmos_predict1.diffusion.inference.instance_segmentation import _cache_layout
+
+
+def _checked_labels(labels, shape, registry):
+    if (labels.dtype == torch.bool or labels.is_floating_point() or labels.is_complex()
+            or tuple(labels.shape) != tuple(shape)):
+        raise ValueError("Labels must be single-channel integer tensors aligned with RGB")
+    # uint64 values must fit in signed int64 before converting.
+    if labels.dtype == torch.uint64 and labels.numel() and labels.cpu().numpy().max() > 2**63 - 1:
+        raise ValueError("Labels exceed int64 range")
+    labels = labels.detach().to(device="cpu", dtype=torch.int64).clone()
+    if (labels < -1).any():
+        raise ValueError("Labels must be -1, 0, or registered positive IDs")
+    if registry is None:
+        raise ValueError("Labels require a source object registry")
+    for instance_id in labels.unique().tolist():
+        if instance_id > 0 and registry.resolve(instance_id) != instance_id:
+            raise ValueError("Rebuild label maps after merging IDs")
+    return labels
+
 
 class Cache3D_Base:
     def __init__(
@@ -38,6 +61,11 @@ class Cache3D_Base:
         device="cuda",
         filter_points_threshold=1.0,
         foreground_masking=False,
+        input_labels=None,
+        object_registry=None,
+        observation_keys=None,
+        source_fingerprint=None,
+        segmentation_revision=None,
     ):
         """
         input_image: Tensor with varying dimensions.
@@ -53,52 +81,45 @@ class Cache3D_Base:
             assert input_image.dim() == 4
             input_format = ["B", "C", "H", "W"]
 
-        # Map dimension names to their indices in input_image
-        format_to_indices = {dim: idx for idx, dim in enumerate(input_format)}
-        input_shape = input_image.shape
+        image = _cache_layout(input_image, input_format)
+        B, F, N, V, C, H, W = image.shape
+        if C != 3:
+            raise ValueError("Cache RGB must have three channels")
+        self.input_image = image.to(device="cpu", dtype=weight_dtype)
+        self.input_mask = None
         if input_mask is not None:
-            input_image = torch.cat([input_image, input_mask], dim=format_to_indices.get("C"))
+            mask = _cache_layout(input_mask, input_format)
+            if mask.shape != (*image.shape[:4], 1, H, W):
+                raise ValueError("Geometry mask must be single-channel and aligned with RGB")
+            self.input_mask = mask.to("cpu").clone()
+        self.object_registry = deepcopy(object_registry)
+        self.input_labels = None if input_labels is None else _checked_labels(
+            _cache_layout(input_labels, input_format), (*image.shape[:4], 1, H, W), self.object_registry,
+        )
+        if segmentation_revision is not None and (
+            self.object_registry is None or segmentation_revision not in self.object_registry.revision_fingerprints
+        ):
+            raise ValueError("Unknown segmentation revision")
+        self.source_fingerprint = source_fingerprint
+        self.segmentation_revision = segmentation_revision
+        self._label_binding = (None if self.object_registry is None else self.object_registry.source_id,
+                               source_fingerprint, segmentation_revision)
+        self._retired_revisions = set()
+        self.observation_keys = None if observation_keys is None else tuple(observation_keys)
+        if self.observation_keys is not None and (
+            len(self.observation_keys) != F * N * V or len(set(self.observation_keys)) != F * N * V
+        ):
+            raise ValueError("Observation keys must match cache frame/view samples")
+        self.observation_to_offset = {} if self.observation_keys is None else {
+            key: (i // (N * V), (i // V) % N, i % V) for i, key in enumerate(self.observation_keys)
+        }
 
-        # B (batch size), F (frame count), N dimensions: no aggregation during warping.
-        # Only broadcasting over F to match the target w2c.
-        # V: aggregate via concatenation or duster
-        B = input_shape[format_to_indices.get("B", 0)] if "B" in format_to_indices else 1  # batch
-        F = input_shape[format_to_indices.get("F", 0)] if "F" in format_to_indices else 1  # frame
-        N = input_shape[format_to_indices.get("N", 0)] if "N" in format_to_indices else 1  # buffer
-        V = input_shape[format_to_indices.get("V", 0)] if "V" in format_to_indices else 1  # view
-        H = input_shape[format_to_indices.get("H", 0)] if "H" in format_to_indices else None
-        W = input_shape[format_to_indices.get("W", 0)] if "W" in format_to_indices else None
-
-        # Desired dimension order
-        desired_dims = ["B", "F", "N", "V", "C", "H", "W"]
-
-        # Build permute order based on input_format
-        permute_order = []
-        for dim in desired_dims:
-            idx = format_to_indices.get(dim)
-            if idx is not None:
-                permute_order.append(idx)
-            else:
-                # Placeholder for dimensions to be added later
-                permute_order.append(None)
-
-        # Remove None values for permute operation
-        permute_indices = [idx for idx in permute_order if idx is not None]
-        input_image = input_image.permute(*permute_indices)
-
-        # Insert dimensions of size 1 where necessary
-        for i, idx in enumerate(permute_order):
-            if idx is None:
-                input_image = input_image.unsqueeze(i)
-
-        # Now input_image has the shape B x F x N x V x C x H x W
-        if input_mask is not None:
-            self.input_image, self.input_mask = input_image[:, :, :, :, :3], input_image[:, :, :, :, 3:]
-            self.input_mask = self.input_mask.to("cpu")
+        # Capture validity before depth sanitization, without changing geometry.
+        if input_points is not None:
+            valid = torch.isfinite(input_points.reshape(B, F, N, V, H, W, 3)).all(-1).unsqueeze(4).cpu()
         else:
-            self.input_mask = None
-            self.input_image = input_image
-        self.input_image = self.input_image.to(weight_dtype).to("cpu")
+            valid = (torch.isfinite(input_depth) & (input_depth > 0)).reshape(B, F, N, V, 1, H, W).cpu()
+        self.input_mask = valid if self.input_mask is None else self.input_mask * valid
 
         if input_points is not None:
             self.input_points = input_points.reshape(B, F, N, V, H, W, 3).to("cpu")
@@ -133,6 +154,64 @@ class Cache3D_Base:
             depth_mask = reliable_depth_mask_range_batch(input_depth)
             self.boundary_mask = (~depth_mask).reshape(B, F, N, V, 1, H, W).to("cpu")
 
+    def _selected_mask(self, selected_ids):
+        if selected_ids is None:
+            return self.input_mask
+        if self.input_labels is None:
+            raise ValueError("Explicit selection requires a labeled cache")
+        resolved = []
+        for instance_id in selected_ids:
+            if type(instance_id) is not int or instance_id < 0:
+                raise ValueError("Select canonical IDs or 0 for environment; -1 is unresolved")
+            resolved.append(0 if instance_id == 0 else self.object_registry.resolve(instance_id))
+        selected = torch.isin(self.input_labels, torch.tensor(resolved, dtype=torch.int64))
+        return selected if self.input_mask is None else self.input_mask * selected
+
+    def replace_labels(self, labeled_source):
+        """Attach a corrected snapshot to unchanged geometry, preserving ID aliases."""
+        kwargs = labeled_source.cache_kwargs()  # Validates maps, source and revision.
+        registry = kwargs['object_registry']
+        revision = kwargs['segmentation_revision']
+        if (self.source_fingerprint is None or kwargs['source_fingerprint'] != self.source_fingerprint
+                or self.object_registry.source_id != registry.source_id
+                or tuple(kwargs['observation_keys']) != self.observation_keys):
+            raise ValueError("Replacement labels must match the original source and observation layout")
+        if (revision in self._retired_revisions
+                or self.segmentation_revision not in registry.revision_fingerprints):
+            raise ValueError("Stale or unrelated segmentation revision")
+        if any(registry.revision_fingerprints.get(old) != fingerprint
+               for old, fingerprint in self.object_registry.revision_fingerprints.items()):
+            raise ValueError("Stale or conflicting segmentation history")
+        if any(old not in registry.aliases or registry.resolve(old) != registry.resolve(target)
+               for old, target in self.object_registry.aliases.items()):
+            raise ValueError("Stale registry would undo an identity merge")
+        labels = _checked_labels(_cache_layout(kwargs['input_labels'], kwargs['input_format']),
+                                 self.input_labels.shape, registry)
+        if revision != self.segmentation_revision:
+            self._retired_revisions.add(self.segmentation_revision)
+        self.input_labels = labels
+        self.object_registry = deepcopy(registry)
+        self.segmentation_revision = revision
+        self._label_binding = (registry.source_id, self.source_fingerprint, revision)
+
+    def check_label_consistency(self):
+        """Check IDs/layout and report semantic versus renderable point counts."""
+        if self.input_labels is None:
+            raise ValueError("Cache has no labels")
+        if self._label_binding != (self.object_registry.source_id, self.source_fingerprint, self.segmentation_revision):
+            raise ValueError("Cache source/revision no longer matches its label attachment")
+        shape = (*self.input_image.shape[:4], 1, *self.input_image.shape[-2:])
+        if self.input_labels.dtype != torch.int64 or self.input_labels.device.type != "cpu":
+            raise ValueError("Cache labels must be CPU int64")
+        _checked_labels(self.input_labels, shape, self.object_registry)
+        if self.input_mask.shape != self.input_labels.shape or self.input_points.shape != (*shape[:4], *shape[-2:], 3):
+            raise ValueError("Labels, points and validity are misaligned")
+        if self.segmentation_revision is not None and self.segmentation_revision not in self.object_registry.revision_fingerprints:
+            raise ValueError("Unknown segmentation revision")
+        return {i: dict(labeled=int((self.input_labels == i).sum()),
+                        renderable=int(((self.input_labels == i) & self.input_mask.bool()).sum()))
+                for i in self.input_labels.unique().tolist()}
+
     def _compute_input_points(self, input_depth, input_w2c, input_intrinsics):
         input_points = unproject_points(
             input_depth,
@@ -148,11 +227,19 @@ class Cache3D_Base:
     def input_frame_count(self) -> int:
         return self.input_image.shape[1]
 
-    def render_cache(self, target_w2cs, target_intrinsics, render_depth=False, start_frame_idx=0):
+    def render_cache(self, target_w2cs, target_intrinsics, render_depth=False, start_frame_idx=0, selected_ids=None):
         bs, F_target, _, _ = target_w2cs.shape
 
         B, F, N, V, C, H, W = self.input_image.shape
         assert bs == B
+        if V != 1:
+            raise NotImplementedError("Rendering V > 1 is deferred; use N for static source views")
+        if type(start_frame_idx) is not int or start_frame_idx < 0 or F_target <= 0:
+            raise ValueError("Render window requires a nonnegative offset and positive frame count")
+        if F > 1 and start_frame_idx + F_target > F:
+            raise ValueError("Render window exceeds cached temporal frames")
+        window = slice(0, 1) if F == 1 else slice(start_frame_idx, start_frame_idx + F_target)
+        selected_mask = self._selected_mask(selected_ids)
 
         target_w2cs = target_w2cs.reshape(B, F_target, 1, 4, 4).expand(B, F_target, N, 4, 4).reshape(-1, 4, 4)
         target_intrinsics = (
@@ -160,16 +247,20 @@ class Cache3D_Base:
         )
 
         # Keep large tensors on CPU; move only per-chunk slices to GPU inside the loop
-        first_images = rearrange(self.input_image[:, start_frame_idx:start_frame_idx+F_target].expand(B, F_target, N, V, C, H, W), "B F N V C H W-> (B F N) V C H W")
+        first_images = rearrange(self.input_image[:, window].expand(B, F_target, N, V, C, H, W), "B F N V C H W-> (B F N) V C H W")
         first_points = rearrange(
-            self.input_points[:, start_frame_idx:start_frame_idx+F_target].expand(B, F_target, N, V, H, W, 3), "B F N V H W C-> (B F N) V H W C"
+            self.input_points[:, window].expand(B, F_target, N, V, H, W, 3), "B F N V H W C-> (B F N) V H W C"
         )
         first_masks = rearrange(
-            self.input_mask[:, start_frame_idx:start_frame_idx+F_target].expand(B, F_target, N, V, 1, H, W), "B F N V C H W-> (B F N) V C H W"
-        ) if self.input_mask is not None else None
+            selected_mask[:, window].expand(B, F_target, N, V, 1, H, W), "B F N V C H W-> (B F N) V C H W"
+        ) if selected_mask is not None else None
+        boundary = self.boundary_mask
+        if boundary is not None and selected_ids is not None:
+            boundary = boundary & selected_mask.bool()
         boundary_masks = rearrange(
-            self.boundary_mask.expand(B, F_target, N, V, 1, H, W), "B F N V C H W-> (B F N) V C H W"
-        ) if self.boundary_mask is not None else None
+            boundary[:, window].expand(B, F_target, N, V, 1, H, W),
+            "B F N V C H W-> (B F N) V C H W",
+        ) if boundary is not None else None
 
         if first_images.shape[1] == 1:
             warp_chunk_size = 2
@@ -185,7 +276,7 @@ class Cache3D_Base:
                     imgs_chunk = first_images[i : i + warp_chunk_size].to(self.device, non_blocking=True)
                     pts_chunk = first_points[i : i + warp_chunk_size].to(self.device, non_blocking=True)
                     masks_chunk = (
-                        first_masks[i : i + warp_chunk_size].to(self.device, non_blocking=True)
+                        first_masks[i : i + warp_chunk_size].to(self.device, non_blocking=True).clone()
                         if first_masks is not None
                         else None
                     )
@@ -243,7 +334,22 @@ class Cache3D_Buffer(Cache3D_Base):
         self.noise_aug_strength = noise_aug_strength
         self.generator = generator
 
-    def update_cache(self, new_image, new_depth, new_w2c, new_mask=None, new_intrinsics=None, depth_alignment=True, alignment_method="non_rigid"):  # 3D cache
+    def update_cache(self, new_image, new_depth, new_w2c, new_mask=None, new_intrinsics=None, depth_alignment=True, alignment_method="non_rigid", new_labels=None):  # 3D cache
+        B, F, N, V, C, H, W = self.input_image.shape
+        if F != 1 or V != 1 or new_image.shape != (B, C, H, W) or new_depth.shape != (B, 1, H, W):
+            raise ValueError("Buffer updates require aligned [B,C,H,W] images and [B,1,H,W] depth")
+        if self.input_labels is not None:
+            if new_labels is None:
+                raise ValueError("Labeled cache updates require associated new_labels")
+            new_labels = _checked_labels(new_labels, (B, 1, H, W), self.object_registry)
+        elif new_labels is not None:
+            raise ValueError("Cannot add labels to an unlabeled buffer update")
+        valid = (torch.isfinite(new_depth) & (new_depth > 0)).cpu()
+        if new_mask is not None:
+            if new_mask.shape != valid.shape:
+                raise ValueError("Update validity must match depth")
+            valid = valid & new_mask.cpu().bool()
+        new_mask = valid
         new_image = new_image.to(self.weight_dtype).to(self.device)
         new_depth = new_depth.to(self.weight_dtype).to(self.device)
         new_w2c = new_w2c.to(self.weight_dtype).to(self.device)
@@ -290,30 +396,35 @@ class Cache3D_Buffer(Cache3D_Base):
         new_points = unproject_points(new_depth, new_w2c, new_intrinsics, is_depth=self.is_depth).cpu()
         new_image = new_image.cpu()
 
+        # Keep every per-point field in the same buffer slots.
+        new_mask = new_mask & (torch.isfinite(new_depth) & (new_depth > 0)).cpu()
         if self.filter_points_threshold < 1.0:
-            B, F, N, V, C, H, W = self.input_image.shape
-            new_depth = new_depth.reshape(-1, 1, H, W)
-            depth_mask = reliable_depth_mask_range_batch(new_depth, ratio_thresh=self.filter_points_threshold).reshape(B, 1, H, W)
-            if new_mask is None:
-                new_mask = depth_mask.to("cpu")
-            else:
-                new_mask = new_mask * depth_mask.to(new_mask.device)
-        if new_mask is not None:
-            new_mask = new_mask.cpu()
-        if self.frame_buffer_max > 1:  # newest frame first
-            if self.input_image.shape[2] < self.frame_buffer_max:
-                self.input_image = torch.cat([new_image[:, None, None, None], self.input_image], 2)
-                self.input_points = torch.cat([new_points[:, None, None, None], self.input_points], 2)
-                if self.input_mask is not None:
-                    self.input_mask = torch.cat([new_mask[:, None, None, None], self.input_mask], 2)
-            else:
-                self.input_image[:, :, 0] = new_image[:, None, None]
-                self.input_points[:, :, 0] = new_points[:, None, None]
-                if self.input_mask is not None:
-                    self.input_mask[:, :, 0] = new_mask[:, None, None]
-        else:
-            self.input_image = new_image[:, None, None, None]
-            self.input_points = new_points[:, None, None, None]
+            new_mask &= reliable_depth_mask_range_batch(
+                new_depth, ratio_thresh=self.filter_points_threshold,
+            ).cpu().bool()
+        fields = dict(input_image=new_image[:, None, None, None],
+                      input_points=new_points[:, None, None, None],
+                      input_mask=new_mask[:, None, None, None])
+        if new_labels is not None:
+            fields['input_labels'] = new_labels[:, None, None, None]
+        if self.boundary_mask is not None:
+            boundary = ~reliable_depth_mask_range_batch(new_depth).cpu().bool()
+            fields['boundary_mask'] = boundary[:, None, None, None]
+        for name, value in fields.items():
+            previous = getattr(self, name)
+            if self.frame_buffer_max > 1:
+                if N < self.frame_buffer_max:
+                    value = torch.cat([value, previous], dim=2)
+                else:
+                    value = torch.cat([value, previous[:, :, 1:]], dim=2)
+            setattr(self, name, value)
+        self.input_depth = new_depth.cpu()
+        # Updated geometry no longer corresponds to the original source snapshot.
+        self.source_fingerprint = None
+        self.segmentation_revision = None
+        self._label_binding = (None if self.object_registry is None else self.object_registry.source_id, None, None)
+        self.observation_keys = None
+        self.observation_to_offset = {}
 
 
     def render_cache(
@@ -322,14 +433,14 @@ class Cache3D_Buffer(Cache3D_Base):
         target_intrinsics,
         render_depth: bool = False,
         start_frame_idx: int = 0,  # For consistency with Cache4D
+        selected_ids=None,
     ):
-        assert start_frame_idx == 0, "start_frame_idx must be 0 for Cache3D_Buffer"
 
         output_device = target_w2cs.device
         target_w2cs = target_w2cs.to(self.weight_dtype).to(self.device)
         target_intrinsics = target_intrinsics.to(self.weight_dtype).to(self.device)
         pixels, masks = super().render_cache(
-            target_w2cs, target_intrinsics, render_depth
+            target_w2cs, target_intrinsics, render_depth, start_frame_idx, selected_ids
         )
         pixels = pixels.to(output_device)
         masks = masks.to(output_device)
@@ -364,6 +475,7 @@ class Cache3D_BufferSelector(Cache3D_Base):
         target_intrinsics,
         render_depth: bool = False,
         start_frame_idx: int = 0,
+        selected_ids=None,
     ):
         # Warp from all buffer frames first
         output_device = target_w2cs.device
@@ -371,7 +483,7 @@ class Cache3D_BufferSelector(Cache3D_Base):
         target_intrinsics = target_intrinsics.to(self.weight_dtype).to(self.device)
 
         pixels_all, masks_all = super().render_cache(
-            target_w2cs, target_intrinsics, render_depth, start_frame_idx
+            target_w2cs, target_intrinsics, render_depth, start_frame_idx, selected_ids
         )  # shapes: [B, F, N, C, H, W] (pixels) and [B, F, N, 1, H, W] (masks)
 
         B, F, N = pixels_all.shape[0], pixels_all.shape[1], pixels_all.shape[2]
@@ -396,7 +508,7 @@ class Cache3D_BufferSelector(Cache3D_Base):
 
             pixels_sel = torch.cat(selected_pixels_list, dim=0)
             masks_sel = torch.cat(selected_masks_list, dim=0)
-        if self.mask_for_max_buffer_model and not render_depth:
+        if self.mask_for_max_buffer_model and not render_depth and selected_ids is None:
             # masks_sel: [B, F, k, 1, H, W]
             _masks = masks_sel.mean(dim=[3, 4, 5])  # -> [B, F, k]
             Bm, Fm, Nm = _masks.shape
@@ -428,6 +540,6 @@ class Cache4D(Cache3D_Base):
     def update_cache(self, **kwargs):
         raise NotImplementedError
 
-    def render_cache(self, target_w2cs, target_intrinsics, render_depth=False, start_frame_idx=0):
-        rendered_warp_images, rendered_warp_masks = super().render_cache(target_w2cs, target_intrinsics, render_depth, start_frame_idx)
+    def render_cache(self, target_w2cs, target_intrinsics, render_depth=False, start_frame_idx=0, selected_ids=None):
+        rendered_warp_images, rendered_warp_masks = super().render_cache(target_w2cs, target_intrinsics, render_depth, start_frame_idx, selected_ids)
         return rendered_warp_images, rendered_warp_masks
