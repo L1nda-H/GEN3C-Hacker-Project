@@ -490,26 +490,33 @@ def segment_source(
     results = {}
     for key, observation in source.observations.items():
         prediction = segmenter.segment(observation.rgb, rgb_range=rgb_range, prompts=prompts.get(key))
-        empty = torch.zeros(observation.rgb.shape[-2:], dtype=torch.bool, device=observation.rgb.device)
-        instances = []
-        occupied, ambiguous = empty.clone(), empty.clone()
-        for proposal in prediction.proposals:
-            mask = proposal.mask
-            instances.append(InstanceObservation(
-                *key, proposal.local_id, mask, proposal.confidence,
-                proposal.name if proposal.name is not None else f"Object {proposal.local_id}",
-                proposal.stability_score, proposal.track_id,
-            ))
-            ambiguous |= occupied & mask
-            occupied |= mask
-            if boundary_width:
-                padded = F.pad(mask[None, None].float(), (boundary_width,) * 4, value=0)
-                eroded = -F.max_pool2d(-padded, 2 * boundary_width + 1, stride=1)[0, 0] > 0
-                ambiguous |= mask & ~eroded
-        environment = environment_masks.get(key, empty)
-        if environment.dtype != torch.bool or environment.shape != empty.shape or environment.device != empty.device:
-            raise ValueError("Confirmed environment must be boolean [H,W] on the prepared RGB device")
-        environment = environment & ~occupied & ~ambiguous
-        results[key] = SegmentedObservation(tuple(instances), ambiguous,
-                                            ~occupied & ~ambiguous & ~environment, environment)
+        results[key] = _segmented_observation(
+            key, observation, prediction.proposals, environment_masks.get(key), boundary_width,
+        )
     return SegmentedSource(source, results)
+
+
+def _segmented_observation(key, observation, proposals, environment=None, boundary_width=0):
+    """Shared image/video uncertainty and confirmed-environment policy."""
+    empty = torch.zeros(observation.rgb.shape[-2:], dtype=torch.bool, device=observation.rgb.device)
+    instances = []
+    occupied, ambiguous = empty.clone(), empty.clone()
+    for proposal in proposals:
+        mask = proposal.mask
+        instances.append(InstanceObservation(
+            *key, proposal.local_id, mask, proposal.confidence,
+            proposal.name if proposal.name is not None else f"Object {proposal.local_id}",
+            proposal.stability_score, proposal.track_id,
+        ))
+        ambiguous |= occupied & mask
+        occupied |= mask
+        if boundary_width:
+            padded = F.pad(mask[None, None].float(), (boundary_width,) * 4, value=0)
+            eroded = -F.max_pool2d(-padded, 2 * boundary_width + 1, stride=1)[0, 0] > 0
+            ambiguous |= mask & ~eroded
+    environment = empty if environment is None else environment
+    if environment.dtype != torch.bool or environment.shape != empty.shape or environment.device != empty.device:
+        raise ValueError("Confirmed environment must be boolean [H,W] on the prepared RGB device")
+    environment = environment & ~occupied & ~ambiguous
+    return SegmentedObservation(tuple(instances), ambiguous,
+                                ~occupied & ~ambiguous & ~environment, environment)

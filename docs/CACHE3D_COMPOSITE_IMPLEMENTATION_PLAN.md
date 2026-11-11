@@ -16,7 +16,7 @@
 
 ## Step 1: segmentation, matching, and labeling
 
-Status: input alignment and the SAM 2.1 image wrapper/checkpoint loader are implemented. Real-checkpoint accuracy validation, GUI integration, geometric association, video propagation, persistence, and cache label attachment remain pending. The video and geometric snippets below remain partial integration sketches.
+Status: input alignment and the SAM 2.1 image wrapper/checkpoint loader are implemented. The video wrapper is implemented with mocked API validation. Real-checkpoint accuracy validation, GUI integration, geometric association, persistence, and cache label attachment remain pending. The geometric snippet below remains a partial integration sketch.
 
 **MVP order:** temporarily skip step 3. Single images follow steps 1 → 2 → 5 → 6; single-camera videos follow steps 1 → 2 (object seeding) → 4 → 5 → 6. Sources retain independent object-ID namespaces when combined in the composite.
 
@@ -175,7 +175,25 @@ Purpose:
 
 Keep one selected object's identity consistent across frames of a single-camera video. A GUI selection can then include that object's labeled points throughout the clip. Still-image sources use step 2 directly and bypass propagation.
 
-Current status: integration pending; this is the next video-input milestone while step 3 is deferred. Reuse SAM's video predictor and existing result containers.
+Current status: `SAM21VideoSegmenter` is implemented in `instance_tracking.py`, reusing the segmentation result containers and image/video uncertainty policy. Seven predictor-contract tests cover numeric frame export, sparse keys, object-row ordering, occlusion, late seeds, prompts, correction invalidation/replay, and checkpoint construction; all 32 local tests pass. Real-checkpoint clip inspection on CUDA remains pending. Step 3 remains deferred.
+
+Usage after step-2 segmentation (`segmented.prepared_source` is one camera with a common image size):
+
+```python
+from cosmos_predict1.diffusion.inference.instance_tracking import SAM21VideoSegmenter
+
+tracker = SAM21VideoSegmenter.from_checkpoint("checkpoints/sam2.1_hiera_large.pt")
+tracker.initialize(segmented.prepared_source, source_id="clip-a", rgb_range=(-1, 1))
+seed_key = (frame_idx, view_id)
+tracker.seed_objects(seed_key, segmented.observations[seed_key].instances)  # Or selected instances only.
+with torch.autocast("cuda", dtype=torch.bfloat16):
+    tracked = tracker.propagate(environment_masks=confirmed_environment_masks)
+    # corrected_instance has the same local_id; SegmentPrompts is also accepted.
+    tracker.correct_object(correction_key, corrected_instance)
+    tracked = tracker.propagate(environment_masks=confirmed_environment_masks)
+```
+
+`frame_keys[offset]` maps SAM offsets to original keys. Caller IDs pass unchanged to SAM; names and scoped track IDs persist through empty masks. Each initialization creates a distinct session namespace. Calls on one wrapper are serialized. Edits set `tracker.result` to `None`; the next propagation resets/replays public SAM seeds and recomputes the full clip in both directions to discard stale temporal memory. Old returned snapshots remain unchanged. Downstream label/render consumers must rebuild from the new snapshot once steps 5–6 exist. Confirmed environment masks remain explicit and per-frame; they are not propagated or inferred. Temporary numeric JPEG export uses synchronous loading and does not alter prepared geometry/RGB tensors.
 
 Requirements:
 
