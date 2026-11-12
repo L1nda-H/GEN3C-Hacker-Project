@@ -22,6 +22,5 @@ Status: planned. Depends on [composite cache and placement](COMPOSITE_CACHE_AND_
 - Synthetic tests: known projection/depth, identity parity, front/back object overlap, environment occlusion, equal-depth ties, invalid geometry, empty selections, holes, and unequal source sizes.
 - Verify all three outputs agree on visibility; test reversed source registration, repeated static frames, moving cameras, and chunk equivalence.
 - Inspect RGB/depth/coverage for one manually placed object in another scene's environment before diffusion.
-- Complete when this composite renders correct conditioning for [stage 3](COMPOSITE_GEN3C_INTEGRATION_PLAN.md).
 
 Deferred: confidence blending, learned/feature fusion, hole filling, and dynamic time mapping.

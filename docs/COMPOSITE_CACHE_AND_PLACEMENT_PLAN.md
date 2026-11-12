@@ -21,6 +21,5 @@ Status: planned. First stage of the **static single-image MVP**; existing segmen
 
 - Test independent ID namespaces, environment rules, alias resolution, invalid selections/layouts/transforms, transform order/pivot, and unchanged children after edits.
 - Test known scale/rotation/translation on synthetic points and identity placement parity.
-- Complete when one object from source A and environment from B yield correctly placed samples for [stage 2](COMPOSITE_RENDERING_AND_FUSION_PLAN.md).
 
 Deferred: automatic placement, GUI, multiview association, dynamic sources, and generated-frame updates.
