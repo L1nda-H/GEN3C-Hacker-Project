@@ -4,7 +4,7 @@ Paths in Python models are filesystem paths; JSON paths are relative to the
 scene file. Loading never estimates depth, prepares images, or resizes labels.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
 
@@ -182,6 +182,8 @@ def build_composite_scene(scene: SceneSpec, *, device='cpu'):
     """Validate persisted artifacts before constructing immutable static children."""
     scene.validate()
     composite = Cache3D_Composite(image_size=tuple(scene.image_size))
+    # Retain provenance from validated labels; review writers need not reload JSON.
+    composite.source_provenance = {}
     for source in scene.sources:
         prepared = load_prepared_source(source.prepared_path, source.fingerprint)
         labeled = load_labeled_source(source.labels_path, prepared)
@@ -201,4 +203,8 @@ def build_composite_scene(scene: SceneSpec, *, device='cpu'):
         composite.set_transform(source.source_id, _transform(source.source_transform))
         for instance_id, matrix in source.object_transforms.items():
             composite.set_transform(source.source_id, _transform(matrix), instance_id=instance_id)
+        composite.source_provenance[source.source_id] = dict(
+            segmentation_revision=labeled.segmented_source.revision,
+            provenance=None if labeled.segmented_source.provenance is None else asdict(labeled.segmented_source.provenance),
+        )
     return composite

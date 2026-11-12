@@ -75,13 +75,15 @@ python -m cosmos_predict1.diffusion.inference.gen3c_composite \
   --scene_spec datasets/composite_example/scene.json \
   --checkpoint_dir checkpoints \
   --prompt "A red chair in a furnished room" \
-  --disable_prompt_upsampler \
   --num_video_frames 241 --height 704 --width 1280 \
   --video_save_folder outputs/composite --video_save_name chair
 ```
 
 Use `120*N+1` frames, at least 121, with enough target cameras. The CLI shares
-the existing Hydra/model initialization and offloading options. It accepts no
+the existing Hydra/model initialization and supported offloading options, without
+initializing SAM. Every prompt must be explicit and nonempty, including batch
+entries. Prompt upsampling is disabled; the composite CLI exposes no upsampler
+or unused tokenizer-directory flags. It accepts no
 legacy `--npz_path`, `--labels_path`, or `--selected_ids` flags; selections belong
 to the scene. It records the supplied `--checkpoint_revision`, or computes a
 SHA256 of the diffusion `model.pt` when omitted (this reads the entire file).
@@ -110,7 +112,8 @@ model pads missing buffer slots with zero latents.
 
 Chunks overlap by one frame. Each continuation uses the preceding generated
 frame as its seed. Source caches remain static and generated-frame cache
-updates are disabled. Persistent-server support remains deferred.
+updates are disabled. Video segments are concatenated once after generation.
+Persistent-server support remains deferred.
 
 ## Review artifacts
 
@@ -132,3 +135,9 @@ CPU contract tests use mocked diffusion. The MVP still requires manual CUDA
 validation on GCP: inspect placement scale, cross-source occlusion, excluded
 object leakage, seed holes, recognizability, and temporal consistency. Record
 visual failures separately from errors already visible in geometric renders.
+
+Generation renders RGB/coverage plus review depth on the writer rank only; it
+does not allocate categorical winner or nearest-depth diagnostics. Review depth
+is released before diffusion, and conditioning buffers before the next chunk.
+Other ranks omit review-only buffers, hashes, and files. Source provenance comes
+from the already validated label records. Preview tools retain full diagnostics.

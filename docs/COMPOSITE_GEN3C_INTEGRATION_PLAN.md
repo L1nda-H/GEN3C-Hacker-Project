@@ -25,3 +25,11 @@ Use a **separate composite pipeline**, `Gen3cCompositePipeline` in `gen3c_compos
 - Complete when one object is correctly composed with the environment in pre-diffusion renders and remains recognizable and consistently placed in the generated moving-camera video. Record visual failures separately from geometric failures.
 
 Deferred: GUI, persistent-server feature parity, automatic alignment, dynamic sources, and generated-frame labeling.
+
+## Review fixes
+
+- Generation uses `render_conditioning()` for RGB/coverage and writer-only review depth; winner IDs and nearest-depth diagnostics remain available for preview tools but are not allocated during generation. Review depth is released before diffusion, and conditioning is released before the next chunk.
+- `composite_review.py` handles review files separately. Scene construction retains validated label provenance; only the writer rank hashes label JSON and writes artifacts, without reparsing label metadata.
+- The composite CLI requires an explicit nonempty prompt for every entry, validated before model loading. Prompt upsampling is disabled; unused upsampler/tokenizer-directory flags are removed. Hydra startup uses no SAM configuration because sources are already prepared and labeled.
+- Continuation retains the latest generated frame and collects video segments; it concatenates once after generation rather than recopying accumulated frames per chunk.
+- Verification: 112 tests pass and one CUDA test skips. Regression tests cover tensor lifetimes, absence of unused diagnostics, writer-only review work, one final concatenation, prompt validation, CLI flags, and model initialization without SAM/upsampling. Manual GCP visual validation remains pending.

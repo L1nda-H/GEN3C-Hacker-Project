@@ -360,3 +360,8 @@ class Cache3D_Composite:
         """
         return self._render(target_w2cs, target_intrinsics, start_frame_idx,
                             rgb=include_rgb, depth=True, diagnostics=True)
+
+    def render_conditioning(self, target_w2cs, target_intrinsics, start_frame_idx=0, *, include_depth=False):
+        """Render diffusion RGB/coverage and optional review depth, without winner metadata."""
+        return self._render(target_w2cs, target_intrinsics, start_frame_idx,
+                            rgb=True, depth=include_depth, diagnostics=False)

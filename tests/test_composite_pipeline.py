@@ -1,7 +1,9 @@
 """Exact artifact loading and end-to-end conditioning with mocked diffusion."""
 
 from copy import deepcopy
+from contextlib import nullcontext
 from dataclasses import replace
+import ast
 import json
 import importlib.util
 from pathlib import Path
@@ -9,6 +11,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+import weakref
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -18,7 +21,7 @@ from cosmos_predict1.diffusion.inference.composite_scene import (
     SceneSource, SceneSpec, build_composite_scene, load_prepared_source, save_prepared_source,
 )
 from cosmos_predict1.diffusion.inference.gen3c_composite_pipeline import Gen3cCompositePipeline
-from cosmos_predict1.diffusion.inference.gen3c_composite import demo, _save_generations
+from cosmos_predict1.diffusion.inference.gen3c_composite import create_parser, demo, _load_prompts, _save_generations
 from cosmos_predict1.diffusion.inference.instance_labeling import (
     label_source, prepared_source_fingerprint, save_labeled_source,
 )
@@ -97,8 +100,8 @@ class CompositePipelineTests(unittest.TestCase):
         snapshots = {name: (cache.input_points.clone(), cache.input_image.clone(), cache.input_labels.clone(),
                              cache.geometry_revision) for name, cache in composite.sources.items()}
         with patch('cosmos_predict1.diffusion.inference.gen3c_composite_pipeline.build_composite_scene',
-                   return_value=composite), patch.object(composite, 'render_diagnostics',
-                                                        wraps=composite.render_diagnostics) as render:
+                   return_value=composite), patch.object(composite, 'render_conditioning',
+                                                        wraps=composite.render_conditioning) as render:
             video, prompt = self.generate()
         self.assertEqual([call.kwargs['start_frame_idx'] for call in render.call_args_list], [0, 2])
         for call, start in zip(render.call_args_list, (0, 2)):
@@ -134,6 +137,105 @@ class CompositePipelineTests(unittest.TestCase):
         with np.load(self.review / 'render_000000.npz') as arrays:
             self.assertEqual(set(arrays.files), {'rgb', 'depth', 'coverage'})
             np.testing.assert_array_equal(arrays['rgb'], first['rendered_warp_images'])
+
+    def test_review_depth_released_before_diffusion_and_conditioning_before_next_render(self):
+        composite = build_composite_scene(self.scene)
+        render = composite.render_conditioning
+        references = {}
+        generated = iter(self.segments)
+
+        def render_chunk(*args, **kwargs):
+            self.assertTrue(all(ref() is None for ref in references.values()))
+            result = render(*args, **kwargs)
+            self.assertEqual(set(result), {'rgb', 'coverage', 'depth'})
+            references.update({key: weakref.ref(value) for key, value in result.items()})
+            return result
+
+        def diffuse(**kwargs):
+            self.assertIsNone(references['depth']())
+            return next(generated), 'final prompt'
+
+        self.diffusion.generate = diffuse  # Avoid mocks retaining input tensors.
+        with patch('cosmos_predict1.diffusion.inference.gen3c_composite_pipeline.build_composite_scene',
+                   return_value=composite), patch.object(composite, 'render_conditioning', render_chunk), \
+                patch.object(composite, 'render_diagnostics', side_effect=AssertionError('Unused diagnostics')):
+            self.generate()
+        self.assertTrue(all(ref() is None for ref in references.values()))
+
+    def test_nonwriter_omits_review_depth_hashes_and_files(self):
+        composite = build_composite_scene(self.scene)
+        with patch('cosmos_predict1.diffusion.inference.gen3c_composite_pipeline.build_composite_scene',
+                   return_value=composite), patch.object(composite, 'render_conditioning',
+                                                        wraps=composite.render_conditioning) as render, \
+                patch('torch.distributed.is_initialized', return_value=True), \
+                patch('torch.distributed.get_rank', return_value=1), \
+                patch('cosmos_predict1.diffusion.inference.composite_review.file_sha256',
+                      side_effect=AssertionError('Nonwriter must not hash review metadata')):
+            self.generate()
+        self.assertTrue(all(not call.kwargs['include_depth'] for call in render.call_args_list))
+        self.assertFalse(self.review.exists())
+
+    def test_writer_uses_validated_provenance_without_reparsing_labels(self):
+        composite = build_composite_scene(self.scene)
+        with patch('cosmos_predict1.diffusion.inference.gen3c_composite_pipeline.build_composite_scene',
+                   return_value=composite), patch('json.loads', side_effect=AssertionError('Repeated JSON parse')):
+            self.generate()
+        sources = json.loads((self.review / 'generation.json').read_text())['sources']
+        for source in sources:
+            self.assertEqual(source['segmentation_revision'],
+                             composite.source_provenance[source['source_id']]['segmentation_revision'])
+            self.assertEqual(len(source['labels_sha256']), 64)
+
+    def test_multi_chunk_video_concatenated_once(self):
+        scene = replace(self.scene, target_w2cs=torch.eye(4).repeat(1, 7, 1, 1),
+                        target_intrinsics=torch.eye(3).repeat(1, 7, 1, 1))
+        third = np.full_like(self.segments[0], 224)
+        self.diffusion.generate.side_effect = [(v, 'prompt') for v in (*self.segments, third)]
+        with patch('numpy.concatenate', wraps=np.concatenate) as concatenate:
+            video, _ = self.generate(scene)
+        self.assertEqual(concatenate.call_count, 1)
+        np.testing.assert_array_equal(video[-2:], third[1:])
+        self.assertEqual(video.shape[0], 7)
+
+    def test_explicit_prompts_required_for_python_and_batch_callers(self):
+        for prompt in (None, '', '  '):
+            with self.subTest(prompt=prompt), self.assertRaisesRegex(ValueError, 'explicit prompt'):
+                self.pipeline.generate(self.scene, prompt=prompt, device='cpu', review_dir=self.review)
+            with self.assertRaisesRegex(ValueError, 'explicit prompt'):
+                _load_prompts(SimpleNamespace(batch_input_path=None, prompt=prompt))
+        io_module = SimpleNamespace(read_prompts_from_file=Mock(return_value=[{'prompt': 'ok'}, {}]))
+        with patch.dict(sys.modules, {'cosmos_predict1.utils.io': io_module}), \
+                self.assertRaisesRegex(ValueError, 'every entry'):
+            _load_prompts(SimpleNamespace(batch_input_path='batch.jsonl'))
+        self.diffusion.generate.assert_not_called()
+
+    def test_cli_omits_upsampler_flags_and_initializes_without_sam(self):
+        # Exercise the actual shared argument helpers without importing CUDA dependencies.
+        path = Path(__file__).parents[1] / 'cosmos_predict1/diffusion/inference/inference_utils.py'
+        functions = [node for node in ast.parse(path.read_text()).body if isinstance(node, ast.FunctionDef)
+                     and node.name in ('add_common_arguments', 'remove_argument')]
+        namespace = {}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), 'exec'), namespace)
+        with patch.dict(sys.modules, {'cosmos_predict1.diffusion.inference.inference_utils': SimpleNamespace(**namespace)}):
+            parser = create_parser()
+        args = parser.parse_args(['--scene_spec', 'unused', '--prompt', 'red object',
+                                  '--height', str(self.h), '--width', str(self.w)])
+        for name in ('prompt_upsampler_dir', 'disable_prompt_upsampler', 'offload_prompt_upsampler', 'tokenizer_dir'):
+            self.assertFalse(hasattr(args, name))
+            self.assertNotIn('--' + name, parser.format_help())
+        args.scene_spec = None
+        scene = replace(self.scene, target_w2cs=torch.eye(4).repeat(1, 121, 1, 1),
+                        target_intrinsics=torch.eye(3).repeat(1, 121, 1, 1))
+        factory = Mock()
+        with patch.dict(sys.modules, {
+            'cosmos_predict1.diffusion.inference.gen3c_pipeline': SimpleNamespace(Gen3cPipeline=factory),
+            'cosmos_predict1.utils.misc': SimpleNamespace(set_random_seed=Mock()),
+        }), patch('cosmos_predict1.utils.model_config.model_config_session', return_value=nullcontext()) as session, \
+                patch('cosmos_predict1.diffusion.inference.gen3c_composite._save_generations'):
+            demo(args, scene)
+        session.assert_called_once_with()
+        self.assertIs(factory.call_args.kwargs['enable_prompt_upsampler'], False)
+        self.assertNotIn('prompt_upsampler_dir', factory.call_args.kwargs)
 
     def test_deterministic_holes_and_low_coverage_failure(self):
         scene = deepcopy(self.scene)
