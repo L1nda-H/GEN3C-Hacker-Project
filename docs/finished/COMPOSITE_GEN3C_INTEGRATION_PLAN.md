@@ -1,6 +1,6 @@
 # 3. Gen3C integration and MVP validation
 
-Status: implemented with CPU contract tests; real CUDA visual validation remains pending. Depends on [composite rendering and fusion](finished/COMPOSITE_RENDERING_AND_FUSION_PLAN.md). See [usage and artifact formats](COMPOSITE_GEN3C_USAGE.md).
+Status: implemented with CPU contract tests; real CUDA visual validation remains pending. Depends on [composite rendering and fusion](COMPOSITE_RENDERING_AND_FUSION_PLAN.md). See [usage and artifact formats](../COMPOSITE_GEN3C_USAGE.md).
 
 ## Scope and contract
 

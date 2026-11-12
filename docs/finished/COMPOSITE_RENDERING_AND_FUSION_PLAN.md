@@ -1,6 +1,6 @@
 # 2. Composite rendering and fusion
 
-Status: implemented and verified on synthetic CPU scenes. Depends on [composite cache and placement](finished/COMPOSITE_CACHE_AND_PLACEMENT_PLAN.md). CUDA execution and representative real-source inspection remain pending; diffusion wiring is the [next stage](COMPOSITE_GEN3C_INTEGRATION_PLAN.md).
+Status: implemented and verified on synthetic CPU scenes. Depends on [composite cache and placement](COMPOSITE_CACHE_AND_PLACEMENT_PLAN.md). CUDA execution and representative real-source inspection remain pending; diffusion wiring is covered by the [integration plan](COMPOSITE_GEN3C_INTEGRATION_PLAN.md).
 
 ## Scope and contract
 

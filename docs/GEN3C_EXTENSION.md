@@ -57,7 +57,9 @@
 - Associate generated-frame labels before enabling generated-frame cache updates.
 - Keep generated geometry in the composite coordinate system.
 
-5. **Connect and verify.** Add a dedicated `Gen3cCompositePipeline` and `gen3c_composite.py` entry point for labeled source loading, composite construction, seeding, and continuation; reuse `Gen3cPipeline` for diffusion and retain its RGB/coverage tensor contract. Keep `gen3c_multiview.py` focused on multiple observations of the same scene. See the [integration plan](COMPOSITE_GEN3C_INTEGRATION_PLAN.md). Feature-level fusion, if chosen later, belongs in the model conditioning path. Before enabling generated-frame cache updates, associate new labels and retain geometry in the correct coordinate frame. Check cross-view/frame ID consistency, selected-only rendering, cross-source occlusion, and static/dynamic time alignment. First milestone: one manually placed static object from one source inside another source's environment.
+5. **Connect and verify.** Add a dedicated `Gen3cCompositePipeline` and `gen3c_composite.py` entry point for labeled source loading, composite construction, seeding, and continuation; reuse `Gen3cPipeline` for diffusion and retain its RGB/coverage tensor contract. Keep `gen3c_multiview.py` focused on multiple observations of the same scene. See the [integration plan](finished/COMPOSITE_GEN3C_INTEGRATION_PLAN.md). Feature-level fusion, if chosen later, belongs in the model conditioning path. Before enabling generated-frame cache updates, associate new labels and retain geometry in the correct coordinate frame. Check cross-view/frame ID consistency, selected-only rendering, cross-source occlusion, and static/dynamic time alignment. First milestone: one manually placed static object from one source inside another source's environment.
+
+The next renderer patch is [adaptive splatting](ADAPTIVE_SPLATTING_PATCH_PLAN.md), using existing PyTorch operations to reduce gaps during camera approach.
 
 ## Validation and first milestone
 
