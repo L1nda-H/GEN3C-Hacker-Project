@@ -142,6 +142,11 @@ def _validate_observation(obs: SourceObservation) -> None:
             raise ValueError("labels must be -1 (unknown), 0 (environment), or positive IDs")
     if len({tensor.device for tensor in tensors}) != 1:
         raise ValueError("All observation tensors must share a device")
+    # One observation owns one camera; the shared validator also supports
+    # batches for rendering, but crop/resize operates on individual matrices.
+    for name, shape in (("w2c", (4, 4)), ("intrinsics", (3, 3))):
+        if getattr(obs, name).shape != shape:
+            raise ValueError(f"Observation {name} must have shape {shape}")
     validate_opencv_cameras(obs.w2c, obs.intrinsics)
 
 

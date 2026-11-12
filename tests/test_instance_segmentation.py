@@ -160,6 +160,19 @@ class PrepareSourceTests(unittest.TestCase):
         for item in invalid:
             with self.subTest(item=item), self.assertRaises(ValueError):
                 prepare_source({(0, 0): item})
+        # Reject batched cameras at the observation boundary even when their
+        # conventions are valid. Crop/resize must not receive batched matrices.
+        for count in (1, 2):
+            for batch_pose, batch_intrinsics in ((True, False), (False, True), (True, True)):
+                item = replace(
+                    obs,
+                    w2c=obs.w2c.repeat(count, 1, 1) if batch_pose else obs.w2c,
+                    intrinsics=obs.intrinsics.repeat(count, 1, 1) if batch_intrinsics else obs.intrinsics,
+                )
+                for kwargs in ({}, dict(crop=(0, 0, 2, 2)), dict(output_size=(2, 2))):
+                    with self.subTest(count=count, pose=batch_pose, intrinsics=batch_intrinsics, kwargs=kwargs):
+                        with self.assertRaisesRegex(ValueError, "Observation .* must have shape"):
+                            prepare_source({(0, 0): item}, **kwargs)
         with self.assertRaisesRegex(ValueError, "OpenCV"):
             prepare_source({(0, 0): obs}, camera_convention="opengl")
         for kwargs in (dict(crop=(2, 3, 2, 2)), dict(output_size=(0, 4)), dict(crop=(-1, 0, 1, 1))):
