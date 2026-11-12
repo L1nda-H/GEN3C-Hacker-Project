@@ -1,6 +1,6 @@
 # 1. Composite cache and placement
 
-Status: implemented. First stage of the **static single-image MVP**; existing segmentation, labeling, and child caches are prerequisites. `cache3d_composite.py` provides registration, selection, manual placement, and selected sample iteration. Rendering/fusion remains the [next stage](COMPOSITE_RENDERING_AND_FUSION_PLAN.md).
+Status: implemented. First stage of the **static single-image MVP**; existing segmentation, labeling, and child caches are prerequisites. `cache3d_composite.py` provides registration, selection, manual placement, and selected sample iteration. Rendering/fusion remains the [next stage](../COMPOSITE_RENDERING_AND_FUSION_PLAN.md).
 
 ## Scope and contract
 

@@ -1,6 +1,6 @@
 # 2. Composite rendering and fusion
 
-Status: planned. Depends on [composite cache and placement](COMPOSITE_CACHE_AND_PLACEMENT_PLAN.md).
+Status: planned. Depends on [composite cache and placement](finished/COMPOSITE_CACHE_AND_PLACEMENT_PLAN.md).
 
 ## Scope and contract
 
