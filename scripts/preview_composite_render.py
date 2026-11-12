@@ -67,8 +67,8 @@ def main():
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     scene, poses, intrinsics = make_scene()
-    rgb, coverage = scene.render_cache(poses, intrinsics)
-    diagnostics = scene.render_diagnostics(poses, intrinsics)
+    diagnostics = scene.render_diagnostics(poses, intrinsics, include_rgb=True)
+    rgb, coverage = diagnostics['rgb'], diagnostics['coverage']
     depth = diagnostics['depth']
     np.savez_compressed(
         args.output_dir / 'buffers.npz', rgb=rgb.numpy(), coverage=coverage.numpy(), depth=depth.numpy(),

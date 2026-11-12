@@ -11,6 +11,7 @@ import math
 import torch
 
 from cosmos_predict1.diffusion.inference.cache_3d import Cache3D_Base
+from cosmos_predict1.diffusion.inference.camera_validation import validate_opencv_cameras
 from cosmos_predict1.diffusion.inference.forward_warp_utils_pytorch import nearest_surface_winners
 
 
@@ -19,13 +20,14 @@ class CompositeSamples:
     """One source/object's valid samples, in original row-major pixel order.
 
     points and rgb are [K,3]; pixel_indices is [K] on the source image grid.
-    Returned tensors own their storage so consumers cannot edit child tensors.
+    RGB is omitted for depth-only rendering. Returned tensors own their storage
+    so consumers cannot edit child tensors.
     """
 
     source_id: str
     instance_id: int
     points: torch.Tensor
-    rgb: torch.Tensor
+    rgb: torch.Tensor | None
     pixel_indices: torch.Tensor
 
 
@@ -210,7 +212,7 @@ class Cache3D_Composite:
             self.object_transforms[source_id, instance_id] = matrix
             self._placement_conflicts.discard((source_id, instance_id))
 
-    def _iter_render_inputs(self):
+    def _iter_render_inputs(self, *, include_rgb=True):
         """Yield selected valid samples in deterministic source/object order.
 
         Check attachments and refresh changed label snapshots before yielding. A
@@ -229,7 +231,7 @@ class Cache3D_Composite:
             inputs.append((source_id, cache, selected))
         for source_id, cache, selected in inputs:
             points = cache.input_points.reshape(-1, 3)
-            rgb = cache.input_image[0, 0, 0, 0].permute(1, 2, 0).reshape(-1, 3)
+            rgb = cache.input_image[0, 0, 0, 0].permute(1, 2, 0).reshape(-1, 3) if include_rgb else None
             labels = cache.input_labels.reshape(-1)
             valid = cache.input_mask.reshape(-1).bool() & torch.isfinite(points).all(-1)
             for instance_id in sorted(selected):
@@ -239,7 +241,7 @@ class Cache3D_Composite:
                 transform = (self.source_transforms[source_id] @ self.object_transforms.get(
                     (source_id, instance_id), self._identity())).to(torch.float32)
                 transformed = points[indices].to(torch.float32) @ transform[:3, :3].T + transform[:3, 3]
-                yield CompositeSamples(source_id, instance_id, transformed, rgb[indices], indices)
+                yield CompositeSamples(source_id, instance_id, transformed, rgb[indices] if include_rgb else None, indices)
 
     def _resolve_visibility(self, points, poses, intrinsics):
         """Replaceable visibility policy; ranks follow source/object/pixel order."""
@@ -261,42 +263,26 @@ class Cache3D_Composite:
                 or target_intrinsics.shape != (*target_w2cs.shape[:2], 3, 3)
                 or target_intrinsics.device != target_w2cs.device):
             raise ValueError("Target intrinsics must be [1,T,3,3] on the camera device")
-        for matrix in (target_w2cs, target_intrinsics):
-            if not matrix.is_floating_point() or not torch.isfinite(matrix).all():
-                raise ValueError("Target cameras must contain finite floating matrices")
-        pose, k = target_w2cs[0].double(), target_intrinsics[0].double()
-        if (not torch.allclose(pose[:, 3], pose.new_tensor([0, 0, 0, 1]).expand(len(pose), -1), atol=1e-5, rtol=0)
-                or not torch.allclose(pose[:, :3, :3].transpose(-1, -2) @ pose[:, :3, :3],
-                                      torch.eye(3, device=pose.device, dtype=pose.dtype).expand(len(pose), -1, -1),
-                                      atol=1e-3, rtol=0)
-                or not torch.allclose(torch.linalg.det(pose[:, :3, :3]), pose.new_ones(len(pose)), atol=1e-3, rtol=0)):
-            raise ValueError("Target w2cs must be right-handed rigid OpenCV world-to-camera matrices")
-        if (not torch.allclose(k[:, 2], k.new_tensor([0, 0, 1]).expand(len(k), -1), atol=1e-5, rtol=0)
-                or (k[:, 0, 0] <= 0).any() or (k[:, 1, 1] <= 0).any() or (k[:, 1, 0].abs() > 1e-5).any()):
-            raise ValueError("Target intrinsics must use the OpenCV pinhole convention")
+        validate_opencv_cameras(target_w2cs, target_intrinsics)
         return target_w2cs[0].float(), target_intrinsics[0].float()
 
     @torch.no_grad()
-    def _render(self, target_w2cs, target_intrinsics, start_frame_idx, diagnostics=False):
+    def _render(self, target_w2cs, target_intrinsics, start_frame_idx, *, rgb, depth, diagnostics=False):
         poses, intrinsics = self._target_cameras(target_w2cs, target_intrinsics, start_frame_idx)
         # Diffusion may call from an autocast context; visibility needs float32.
         with torch.autocast(device_type=poses.device.type, enabled=False):
-            return self._render_frames(poses, intrinsics, diagnostics)
+            return self._render_frames(poses, intrinsics, rgb=rgb, depth=depth, diagnostics=diagnostics)
 
-    def _render_frames(self, poses, intrinsics, diagnostics):
-        # Iterator order is exactly the categorical tie priority. Keep the static
-        # sample table on CPU and transfer only projection chunks or winning RGB.
-        samples = list(self._iter_render_inputs())
+    def _render_frames(self, poses, intrinsics, *, rgb, depth, diagnostics):
+        # Iterator order is exactly the categorical tie priority. Release the
+        # per-object copies once the flat CPU sample table has been assembled.
+        samples = list(self._iter_render_inputs(include_rgb=rgb))
         points = torch.cat([s.points for s in samples]) if samples else torch.empty(0, 3, dtype=torch.float32)
-        colors = torch.cat([s.rgb.float() for s in samples]) if samples else torch.empty(0, 3, dtype=torch.float32)
-        if self.rgb_range != (-1., 1.):
-            colors = (colors - self.rgb_range[0]) * (2 / (self.rgb_range[1] - self.rgb_range[0])) - 1
-        frames, (height, width) = len(poses), self.image_size
-        device = poses.device
-        rgb = torch.full((frames, height, width, 3), -1., device=device, dtype=torch.float32)
-        depth = torch.zeros((frames, height, width), device=device, dtype=torch.float32)
-        coverage = torch.zeros_like(depth)
-        details = None
+        colors = None
+        if rgb:
+            colors = torch.cat([s.rgb.float() for s in samples]) if samples else torch.empty(0, 3, dtype=torch.float32)
+            if self.rgb_range != (-1., 1.):
+                colors = (colors - self.rgb_range[0]) * (2 / (self.rgb_range[1] - self.rgb_range[0])) - 1
         if diagnostics:
             source_ids = tuple(sorted(self.sources))
             source_index = {source_id: i for i, source_id in enumerate(source_ids)}
@@ -305,41 +291,72 @@ class Cache3D_Composite:
                              torch.full_like(s.pixel_indices, s.instance_id), s.pixel_indices], dim=-1)
                 for s in samples
             ]) if samples else torch.empty(0, 3, dtype=torch.int64)
-            details = dict(source_ids=source_ids, winners=torch.full(
-                (1, frames, height, width, 3), -1, dtype=torch.int64, device=device),
-                nearest_depth=torch.zeros_like(depth)[None, :, None])
+        del samples
+
+        frames, (height, width) = len(poses), self.image_size
+        pixels = height * width
+        device = poses.device
+        # Flat storage lets bounded winner batches write directly into outputs.
+        coverage = torch.zeros(frames * pixels, device=device, dtype=torch.float32)
+        image = torch.full((frames * pixels, 3), -1., device=device, dtype=torch.float32) if rgb else None
+        z_buffer = torch.zeros_like(coverage) if depth else None
+        if diagnostics:
+            winners = torch.full((frames * pixels, 3), -1, dtype=torch.int64, device=device)
+            nearest_depth = torch.zeros_like(coverage)
         for start in range(0, frames, self.frame_chunk_size):
             end = min(start + self.frame_chunk_size, frames)
             winner, nearest = self._resolve_visibility(points, poses[start:end], intrinsics[start:end])
-            frame, y, x = torch.nonzero(winner >= 0, as_tuple=True)
-            rank = winner[frame, y, x].cpu()
-            chosen = points[rank].to(device)
-            # Camera-Z is from the chosen point, which can differ from the
-            # numerical minimum within tolerance. All buffers use that winner.
-            z = (chosen * poses[start:end][frame, 2, :3]).sum(-1) + poses[start:end][frame, 2, 3]
-            rgb[start + frame, y, x] = colors[rank].to(device)
-            depth[start + frame, y, x] = z
-            coverage[start + frame, y, x] = 1
             if diagnostics:
-                details['winners'][0, start + frame, y, x] = metadata[rank].to(device)
-                details['nearest_depth'][0, start:end, 0] = nearest
-        return rgb.permute(0, 3, 1, 2)[None, :, None], coverage[None, :, None, None], depth[None, :, None], details
+                nearest_depth[start * pixels:end * pixels] = nearest.reshape(-1)
+            winner = winner.reshape(-1)
+            # Bound indices, CPU/GPU transfers, and selected attributes as well
+            # as projection work. Never materialize all covered pixel indices.
+            for offset in range(0, winner.numel(), self.point_chunk_size):
+                batch = winner[offset:offset + self.point_chunk_size]
+                covered = torch.nonzero(batch >= 0, as_tuple=True)[0]
+                if not covered.numel():
+                    continue
+                rank = batch[covered].cpu()
+                destination = start * pixels + offset + covered
+                coverage[destination] = 1
+                if rgb:
+                    image[destination] = colors[rank].to(device)
+                if depth:
+                    frame = (offset + covered) // pixels + start
+                    chosen = points[rank].to(device)
+                    # Preserve the selected point's actual camera-Z, including
+                    # when categorical priority chooses a near-equal surface.
+                    z_buffer[destination] = (chosen * poses[frame, 2, :3]).sum(-1) + poses[frame, 2, 3]
+                if diagnostics:
+                    winners[destination] = metadata[rank].to(device)
+        result = dict(coverage=coverage.reshape(1, frames, 1, 1, height, width))
+        if rgb:
+            result['rgb'] = image.reshape(frames, height, width, 3).permute(0, 3, 1, 2)[None, :, None]
+        if depth:
+            result['depth'] = z_buffer.reshape(1, frames, 1, height, width)
+        if diagnostics:
+            result.update(source_ids=source_ids, winners=winners.reshape(1, frames, height, width, 3),
+                          nearest_depth=nearest_depth.reshape(1, frames, 1, height, width))
+        return result
 
     def render_cache(self, target_w2cs, target_intrinsics, render_depth=False, start_frame_idx=0):
-        """Render float32 RGB/depth and binary coverage on the target camera device.
+        """Render float32 RGB/depth and binary coverage on the camera device.
 
         RGB [1,T,1,3,H,W] uses [-1,1], depth [1,T,1,H,W] is camera-Z,
         coverage [1,T,1,1,H,W] is shared by both. Hole values are -1/0/0.
-        Static sources repeat at any nonnegative start_frame_idx.
+        Static sources repeat at any nonnegative start_frame_idx. Only the
+        requested RGB or depth buffer is allocated and populated.
         """
-        rgb, coverage, depth, _ = self._render(target_w2cs, target_intrinsics, start_frame_idx)
-        return (depth if render_depth else rgb), coverage
+        result = self._render(target_w2cs, target_intrinsics, start_frame_idx,
+                              rgb=not render_depth, depth=render_depth)
+        return result['depth' if render_depth else 'rgb'], result['coverage']
 
-    def render_diagnostics(self, target_w2cs, target_intrinsics, start_frame_idx=0):
+    def render_diagnostics(self, target_w2cs, target_intrinsics, start_frame_idx=0, *, include_rgb=False):
         """Return depth, coverage, nearest_depth, and categorical winner metadata.
 
         winners [1,T,H,W,3] stores (source index into source_ids, canonical ID,
         original pixel index), with -1 for holes. IDs always remain int64.
+        Set include_rgb=True to obtain all buffers in one visibility pass.
         """
-        _, coverage, depth, details = self._render(target_w2cs, target_intrinsics, start_frame_idx, diagnostics=True)
-        return dict(details, depth=depth, coverage=coverage)
+        return self._render(target_w2cs, target_intrinsics, start_frame_idx,
+                            rgb=include_rgb, depth=True, diagnostics=True)

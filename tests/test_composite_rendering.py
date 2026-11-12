@@ -3,6 +3,7 @@
 import unittest
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from cosmos_predict1.diffusion.inference.cache_3d import Cache3D_Base
 from cosmos_predict1.diffusion.inference.cache3d_composite import Cache3D_Composite
@@ -237,6 +238,64 @@ class RenderingTests(unittest.TestCase):
         torch.testing.assert_close(rgb[0, 0, 0, :, 0, 0], torch.tensor([-1., 0, 1]))
         for name, snapshot in snapshots.items():
             torch.testing.assert_close(snapshot, getattr(env, name))
+
+    def test_combined_diagnostics_matches_separate_outputs(self):
+        scene = composite(source('room', [[0, 0, 2], [2, 0, 2], [4, 0, 2]]),
+                          frame_chunk_size=3, point_chunk_size=4)
+        target = cameras(5)
+        target[0][0, 2, 0, 3] = 2
+        rgb, coverage, depth = self.render(scene, target)
+        separate = scene.render_diagnostics(*target)
+        self.assertNotIn('rgb', separate)
+        combined = scene.render_diagnostics(*target, include_rgb=True)
+        for name, expected in [('rgb', rgb), ('depth', depth), ('coverage', coverage)]:
+            torch.testing.assert_close(combined[name], expected, rtol=0, atol=0)
+        for name in ('winners', 'nearest_depth'):
+            torch.testing.assert_close(combined[name], separate[name], rtol=0, atol=0)
+        self.assertEqual(combined['source_ids'], separate['source_ids'])
+        # Also exercise the optional buffers for a scene without valid samples.
+        scene.set_selection('room', [])  # environment stays selected
+        scene.sources['room'].input_mask.zero_()
+        empty = scene.render_diagnostics(*target, include_rgb=True)
+        self.assertTrue((empty['rgb'] == -1).all())
+        self.assertFalse(empty['coverage'].any())
+        self.assertTrue((empty['winners'] == -1).all())
+
+    def test_output_allocations_and_winner_gathers_are_bounded(self):
+        # Three points cover nine pixels across frames. Four-sample batches
+        # therefore exercise both a frame boundary and a partial final batch.
+        scene = composite(source('room', [[0, 0, 1], [1, 0, 1], [2, 0, 1]]),
+                          image_size=(2, 3), frame_chunk_size=3, point_chunk_size=4)
+        target = cameras(3)
+        allocations, gathers = [], []
+
+        class MemoryOperations(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                result = func(*args, **(kwargs or {}))
+                if func in (torch.ops.aten.full.default, torch.ops.aten.zeros_like.default):
+                    allocations.append((func, tuple(result.shape), result.dtype))
+                if (func == torch.ops.aten.index.Tensor and args[0].ndim == 2
+                        and args[0].shape[-1] == 3 and len(args[1]) == 1):
+                    gathers.append(len(result))
+                return result
+
+        with MemoryOperations():
+            _, coverage = scene.render_cache(*target)
+        self.assertEqual(coverage.sum(), 9)
+        self.assertNotIn((torch.ops.aten.zeros_like.default, (18,), torch.float32), allocations)
+        allocations.clear()
+        with MemoryOperations():
+            depth, depth_coverage = scene.render_cache(*target, render_depth=True)
+        self.assertNotIn((torch.ops.aten.full.default, (18, 3), torch.float32), allocations)
+        self.assertEqual(depth.sum(), 9)
+        torch.testing.assert_close(coverage, depth_coverage, rtol=0, atol=0)
+        allocations.clear()
+        with MemoryOperations():
+            details = scene.render_diagnostics(*target)
+        self.assertNotIn((torch.ops.aten.full.default, (18, 3), torch.float32), allocations)
+        torch.testing.assert_close(details['depth'], depth, rtol=0, atol=0)
+        self.assertTrue(gathers)
+        self.assertLessEqual(max(gathers), scene.point_chunk_size)
 
     @unittest.skipUnless(torch.cuda.is_available(), 'CUDA unavailable')
     def test_cuda_device_and_cpu_parity(self):

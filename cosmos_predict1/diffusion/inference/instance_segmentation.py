@@ -11,6 +11,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from cosmos_predict1.diffusion.inference.camera_validation import validate_opencv_cameras
+
 
 ObservationKey = tuple[int, int]
 
@@ -140,23 +142,7 @@ def _validate_observation(obs: SourceObservation) -> None:
             raise ValueError("labels must be -1 (unknown), 0 (environment), or positive IDs")
     if len({tensor.device for tensor in tensors}) != 1:
         raise ValueError("All observation tensors must share a device")
-    for name, shape in (("intrinsics", (3, 3)), ("w2c", (4, 4))):
-        matrix = getattr(obs, name)
-        if matrix.shape != shape or not matrix.is_floating_point() or not torch.isfinite(matrix).all():
-            raise ValueError(f"{name} must be a finite floating matrix {shape}")
-    # Check in float64 so input precision does not weaken convention checks.
-    k, pose = obs.intrinsics.double(), obs.w2c.double()
-    if not torch.allclose(k[2], k.new_tensor([0, 0, 1]), atol=1e-5, rtol=0):
-        raise ValueError("Intrinsics must use OpenCV pinhole convention with last row [0, 0, 1]")
-    if k[0, 0] <= 0 or k[1, 1] <= 0 or abs(k[1, 0]) > 1e-5:
-        raise ValueError("Intrinsics require positive focal lengths and an upper triangular matrix")
-    if not torch.allclose(pose[3], pose.new_tensor([0, 0, 0, 1]), atol=1e-5, rtol=0):
-        raise ValueError("w2c must have homogeneous last row [0, 0, 0, 1]")
-    rotation = pose[:3, :3]
-    if not torch.allclose(rotation.T @ rotation, torch.eye(3, device=pose.device, dtype=pose.dtype), atol=1e-3):
-        raise ValueError("w2c must be rigid; source scale belongs in depth and translation units")
-    if not torch.isclose(torch.linalg.det(rotation), pose.new_tensor(1), atol=1e-3):
-        raise ValueError("w2c rotation must be right-handed")
+    validate_opencv_cameras(obs.w2c, obs.intrinsics)
 
 
 def _nearest_resize(tensor: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:

@@ -122,6 +122,26 @@ class PrepareSourceTests(unittest.TestCase):
                 torch.testing.assert_close(cache.input_points[0, i, j, 0, 1, 1],
                                            torch.tensor([-view, 0, 2 * frame], dtype=torch.float32))
 
+    def test_source_and_target_camera_conventions_agree(self):
+        from cosmos_predict1.diffusion.inference.camera_validation import validate_opencv_cameras
+
+        obs = observation()
+        validate_opencv_cameras(obs.w2c, obs.intrinsics)
+        validate_opencv_cameras(obs.w2c.repeat(1, 2, 1, 1), obs.intrinsics.repeat(1, 2, 1, 1))
+        # Apply the same absolute rigidity tolerance to individual and batched
+        # cameras, including matrices just outside the accepted tolerance.
+        for delta in (.0004, .0006):
+            pose = obs.w2c.clone()
+            pose[0, 0] += delta
+            for batched in (False, True):
+                w2c = pose[None] if batched else pose
+                k = obs.intrinsics[None] if batched else obs.intrinsics
+                if delta == .0004:
+                    validate_opencv_cameras(w2c, k)
+                else:
+                    with self.assertRaises(ValueError):
+                        validate_opencv_cameras(w2c, k)
+
     def test_rejects_misalignment_and_invalid_cameras(self):
         obs = observation()
         bad_pose = torch.eye(4)
