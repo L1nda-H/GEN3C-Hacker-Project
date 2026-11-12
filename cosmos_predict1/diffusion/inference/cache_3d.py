@@ -101,6 +101,7 @@ class Cache3D_Base:
         ):
             raise ValueError("Unknown segmentation revision")
         self.source_fingerprint = source_fingerprint
+        self.geometry_revision = 0
         self.segmentation_revision = segmentation_revision
         self._label_binding = (None if self.object_registry is None else self.object_registry.source_id,
                                source_fingerprint, segmentation_revision)
@@ -425,6 +426,7 @@ class Cache3D_Buffer(Cache3D_Base):
         self._label_binding = (None if self.object_registry is None else self.object_registry.source_id, None, None)
         self.observation_keys = None
         self.observation_to_offset = {}
+        self.geometry_revision += 1
 
 
     def render_cache(

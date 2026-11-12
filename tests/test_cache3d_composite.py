@@ -1,6 +1,7 @@
 """CPU contracts for static composite selection, placement, and child ownership."""
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -102,7 +103,7 @@ class CompositeTests(unittest.TestCase):
         self.assertNotIn(('objects', 1), samples)
         sample = samples['objects', 2]
         self.assertEqual(sample.pixel_indices.tolist(), [2])
-        torch.testing.assert_close(sample.points, self.object.input_points.reshape(-1, 3)[[2]].double())
+        torch.testing.assert_close(sample.points, self.object.input_points.reshape(-1, 3)[[2]].float())
         expected_rgb = self.object.input_image[0, 0, 0, 0, :, 0, 2][None]
         torch.testing.assert_close(sample.rgb, expected_rgb)
         # Each target frame consumes the same static geometry, without a time mapping.
@@ -121,9 +122,9 @@ class CompositeTests(unittest.TestCase):
         self.composite.set_transform('objects', source_transform)
         placed = self.samples()['objects', 1].points
         homogeneous = torch.cat([original, torch.ones(len(original), 1)], dim=1)
-        expected = (source_transform @ object_transform @ homogeneous.T).T[:, :3]
+        expected = (source_transform @ object_transform @ homogeneous.double().T).T[:, :3].float()
         torch.testing.assert_close(placed, expected)
-        torch.testing.assert_close(placed, torch.tensor([[6., 6, 0], [6, 2, 0]], dtype=torch.float64))
+        torch.testing.assert_close(placed, torch.tensor([[6., 6, 0], [6, 2, 0]], dtype=torch.float32))
         # A point at the chosen source-space pivot remains there under object placement.
         torch.testing.assert_close(object_transform @ pivot[:, 3], pivot[:, 3])
         object_transform.fill_(0)  # The setter owns its matrix.
@@ -131,7 +132,7 @@ class CompositeTests(unittest.TestCase):
         self.composite.set_transform('room', translation(3), instance_id=1)
         self.composite.set_selection('room', [1])
         torch.testing.assert_close(self.samples()['room', 0].points,
-                                   self.environment.input_points.reshape(-1, 3)[[0, 5]].double())
+                                   self.environment.input_points.reshape(-1, 3)[[0, 5]].float())
 
     def test_reject_invalid_transforms(self):
         invalid = [torch.eye(3), torch.full((4, 4), float('nan')), torch.full((4, 4), float('inf')),
@@ -217,7 +218,62 @@ class CompositeTests(unittest.TestCase):
         cache.replace_labels(updated)
         sample = self.samples()['corrected', survivor]
         self.assertEqual(sample.pixel_indices.tolist(), [5])
-        torch.testing.assert_close(sample.points, torch.tensor([[6., 1, 1]], dtype=torch.float64))
+        torch.testing.assert_close(sample.points, torch.tensor([[6., 1, 1]], dtype=torch.float32))
+
+    def test_unfingerprinted_buffer_update_invalidates_attachment(self):
+        buffer = child('buffer', cache_type=Cache3D_Buffer)
+        self.assertIsNone(buffer.source_fingerprint)
+        self.assertIsNone(buffer.observation_keys)
+        self.composite.add_source('buffer', buffer)
+        buffer.update_cache(torch.ones(1, 3, 2, 3), torch.ones(1, 1, 2, 3),
+                            torch.eye(4)[None], new_intrinsics=torch.eye(3)[None], depth_alignment=False,
+                            new_labels=torch.ones(1, 1, 2, 3, dtype=torch.int64))
+        for action in (self.samples, lambda: self.composite.set_selection('buffer', [1]),
+                       lambda: self.composite.set_transform('buffer', translation(1)),
+                       lambda: self.composite.refresh_source('buffer')):
+            with self.assertRaisesRegex(ValueError, 'attachment'):
+                action()
+
+    def test_placement_and_render_skip_full_validation_until_correction(self):
+        with patch.object(self.object, 'check_label_consistency',
+                          wraps=self.object.check_label_consistency) as validate:
+            for offset in range(3):
+                self.composite.set_selection('objects', [1])
+                self.composite.set_transform('objects', translation(offset), instance_id=1)
+                self.samples()
+            validate.assert_not_called()
+            # A replacement label snapshot triggers one full validation/refresh.
+            self.object.input_labels = self.object.input_labels.clone()
+            self.samples()
+            self.samples()
+            self.assertEqual(validate.call_count, 1)
+            # Direct in-place edits require explicit refresh, which validates RGB too.
+            self.object.input_image.fill_(2)
+            with self.assertRaisesRegex(ValueError, 'RGB'):
+                self.composite.refresh_source('objects')
+
+    def test_unselected_merge_conflict_does_not_block_other_objects(self):
+        self.composite.set_transform('objects', translation(1), instance_id=1)
+        self.composite.set_transform('objects', translation(2), instance_id=2)
+        self.object.object_registry.merge_ids(1, 2)
+        self.object.input_labels[self.object.input_labels == 1] = 2
+        self.assertEqual(set(self.samples()), {('room', 0)})
+        self.composite.set_selection('objects', [1])
+        with self.assertRaisesRegex(ValueError, 'conflicting transforms'):
+            self.samples()
+        self.composite.refresh_source('objects')  # Conflict survives additional refreshes.
+        with self.assertRaisesRegex(ValueError, 'conflicting transforms'):
+            self.samples()
+        self.composite.set_transform('objects', translation(3), instance_id=1)
+        self.assertIn(('objects', 2), self.samples())
+
+    def test_render_samples_use_float32_without_changing_child_precision(self):
+        self.object.input_points = self.object.input_points.double()
+        self.composite.set_selection('objects', [1])
+        sample = self.samples()['objects', 1]
+        self.assertEqual(sample.points.dtype, torch.float32)
+        self.assertEqual(self.object.input_points.dtype, torch.float64)
+        self.assertEqual(self.composite.source_transforms['objects'].dtype, torch.float64)
 
 
 if __name__ == '__main__':

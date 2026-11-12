@@ -48,6 +48,8 @@ class Cache3D_Composite:
         self.source_transforms = {}
         self.object_transforms = {}
         self._attachments = {}
+        self._label_states = {}
+        self._placement_conflicts = set()
 
     @staticmethod
     def _identity():
@@ -88,15 +90,60 @@ class Cache3D_Composite:
         if (not torch.isfinite(image).all() or (image < self.rgb_range[0]).any()
                 or (image > self.rgb_range[1]).any()):
             raise ValueError(f"Source RGB must be finite and within the shared range {self.rgb_range}")
-        attachment = (cache.source_fingerprint, cache.observation_keys)
-        if source_id in self._attachments and self._attachments[source_id] != attachment:
+
+    @staticmethod
+    def _attachment(cache):
+        return (id(cache), cache.geometry_revision, cache.source_fingerprint, cache.observation_keys)
+
+    @staticmethod
+    def _label_state(cache):
+        registry = cache.object_registry
+        return (id(cache.input_labels), id(registry), cache.segmentation_revision,
+                cache._label_binding,
+                None if registry is None else (registry.source_id, tuple(sorted(registry.aliases.items())),
+                                                tuple(sorted(registry.names))))
+
+    def refresh_source(self, source_id):
+        """Validate corrections and canonicalize IDs once, retaining placements.
+
+        replace_labels() is detected automatically. Call this explicitly after
+        editing child tensors in place; arbitrary direct edits are not tracked.
+        Geometry changes through update_cache() always require rebuilding.
+        """
+        if source_id not in self.sources:
+            raise ValueError(f"Unknown source ID {source_id!r}")
+        cache = self.sources[source_id]
+        if self._attachments[source_id] != self._attachment(cache):
             raise ValueError(f"Source attachment for {source_id!r} changed; rebuild the composite")
+        self._validate_source(source_id, cache)
+        selected = frozenset(self._resolve(source_id, i, cache) for i in self.selections[source_id])
+        placements = {}
+        conflicts = set()
+        for (owner, instance_id), matrix in self.object_transforms.items():
+            if owner != source_id:
+                continue
+            resolved = self._resolve(source_id, instance_id, cache)
+            key = (source_id, resolved)
+            if (source_id, instance_id) in self._placement_conflicts:
+                conflicts.add(key)
+            if resolved in placements and not torch.equal(placements[resolved], matrix):
+                conflicts.add(key)
+            placements[resolved] = matrix
+        self.selections[source_id] = selected
+        self.object_transforms = {key: matrix for key, matrix in self.object_transforms.items()
+                                  if key[0] != source_id}
+        self.object_transforms.update({(source_id, i): matrix for i, matrix in placements.items()})
+        self._placement_conflicts = {key for key in self._placement_conflicts if key[0] != source_id} | conflicts
+        self._label_states[source_id] = self._label_state(cache)
 
     def _source(self, source_id):
         if source_id not in self.sources:
             raise ValueError(f"Unknown source ID {source_id!r}")
         cache = self.sources[source_id]
-        self._validate_source(source_id, cache)
+        if self._attachments[source_id] != self._attachment(cache):
+            raise ValueError(f"Source attachment for {source_id!r} changed; rebuild the composite")
+        if self._label_states[source_id] != self._label_state(cache):
+            self.refresh_source(source_id)
         return cache
 
     def add_source(self, source_id, cache, is_environment=False):
@@ -109,7 +156,8 @@ class Cache3D_Composite:
         self.sources[source_id] = cache
         self.selections[source_id] = frozenset({0} if is_environment else ())
         self.source_transforms[source_id] = self._identity()
-        self._attachments[source_id] = (cache.source_fingerprint, cache.observation_keys)
+        self._attachments[source_id] = self._attachment(cache)
+        self._label_states[source_id] = self._label_state(cache)
         if is_environment:
             self.environment_source_id = source_id
 
@@ -142,16 +190,13 @@ class Cache3D_Composite:
             instance_id = self._resolve(source_id, instance_id, cache)
             if instance_id == 0:
                 raise ValueError("Cannot transform environment ID 0")
-            # Replace any transform now resolving to the same merged object.
-            for key in list(self.object_transforms):
-                if key[0] == source_id and cache.object_registry.resolve(key[1]) == instance_id:
-                    del self.object_transforms[key]
             self.object_transforms[source_id, instance_id] = matrix
+            self._placement_conflicts.discard((source_id, instance_id))
 
     def _iter_render_inputs(self):
         """Yield selected valid samples in deterministic source/object order.
 
-        Revalidate all attachments, selections and aliases before yielding. A
+        Check attachments and refresh changed label snapshots before yielding. A
         label correction may merge selected IDs; differing placements on merged
         objects require an explicit set_transform() to resolve the conflict.
         Empty objects yield no samples. No target time is needed for static data.
@@ -161,19 +206,11 @@ class Cache3D_Composite:
         inputs = []
         for source_id in sorted(self.sources):
             cache = self._source(source_id)
-            selected = {self._resolve(source_id, i, cache) for i in self.selections[source_id]}
-            if source_id == self.environment_source_id:
-                selected.add(0)
-            placements = {}
-            for (owner, instance_id), matrix in self.object_transforms.items():
-                if owner != source_id:
-                    continue
-                resolved = self._resolve(source_id, instance_id, cache)
-                if resolved in placements and not torch.equal(placements[resolved], matrix):
-                    raise ValueError("Merged objects have conflicting transforms; call set_transform again")
-                placements[resolved] = matrix
-            inputs.append((source_id, cache, selected, placements))
-        for source_id, cache, selected, placements in inputs:
+            selected = self.selections[source_id]
+            if any((source_id, i) in self._placement_conflicts for i in selected):
+                raise ValueError("Merged objects have conflicting transforms; call set_transform again")
+            inputs.append((source_id, cache, selected))
+        for source_id, cache, selected in inputs:
             points = cache.input_points.reshape(-1, 3)
             rgb = cache.input_image[0, 0, 0, 0].permute(1, 2, 0).reshape(-1, 3)
             labels = cache.input_labels.reshape(-1)
@@ -182,6 +219,7 @@ class Cache3D_Composite:
                 indices = torch.nonzero(valid & (labels == instance_id), as_tuple=True)[0]
                 if not indices.numel():
                     continue
-                transform = self.source_transforms[source_id] @ placements.get(instance_id, self._identity())
-                transformed = points[indices].to(torch.float64) @ transform[:3, :3].T + transform[:3, 3]
+                transform = (self.source_transforms[source_id] @ self.object_transforms.get(
+                    (source_id, instance_id), self._identity())).to(torch.float32)
+                transformed = points[indices].to(torch.float32) @ transform[:3, :3].T + transform[:3, 3]
                 yield CompositeSamples(source_id, instance_id, transformed, rgb[indices], indices)
