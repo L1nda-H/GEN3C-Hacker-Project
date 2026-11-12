@@ -1,6 +1,6 @@
 # 2. Composite rendering and fusion
 
-Status: planned. Depends on [composite cache and placement](finished/COMPOSITE_CACHE_AND_PLACEMENT_PLAN.md).
+Status: implemented and verified on synthetic CPU scenes. Depends on [composite cache and placement](finished/COMPOSITE_CACHE_AND_PLACEMENT_PLAN.md). CUDA execution and representative real-source inspection remain pending; diffusion wiring is the [next stage](COMPOSITE_GEN3C_INTEGRATION_PLAN.md).
 
 ## Scope and contract
 
@@ -24,3 +24,31 @@ Status: planned. Depends on [composite cache and placement](finished/COMPOSITE_C
 - Inspect RGB/depth/coverage for one manually placed object in another scene's environment before diffusion.
 
 Deferred: confidence blending, learned/feature fusion, hole filling, and dynamic time mapping.
+
+## Implemented API and numerical policy
+
+```python
+composite = Cache3D_Composite(
+    image_size=(height, width),  # Required to render; independent of source sizes.
+    depth_tolerance=1e-5,       # Absolute camera-Z tolerance in destination units.
+    frame_chunk_size=2,
+    point_chunk_size=65536,
+)
+# Register labeled children, select IDs, and set placement as in stage 1.
+rgb, coverage = composite.render_cache(target_w2cs, target_intrinsics)
+depth, same_coverage = composite.render_cache(target_w2cs, target_intrinsics, render_depth=True)
+diagnostics = composite.render_diagnostics(target_w2cs, target_intrinsics)
+```
+
+- Target cameras are finite floating tensors `[1,T,4,4]` and `[1,T,3,3]` on the same device. Poses must be right-handed rigid OpenCV world-to-camera matrices; intrinsics use the upper-triangular pinhole convention. `T` must be positive. Any nonnegative integer `start_frame_idx` is accepted for static geometry.
+- Outputs are float32 on the target camera device, including inside diffusion autocast contexts. RGB/depth/coverage retain the layouts and hole values above. A nondefault shared source `rgb_range` is linearly mapped to `[-1,1]` for rendering.
+- A point contributes only with finite camera coordinates, positive camera-Z, and finite projected coordinates. Nearest-pixel assignment uses `floor(uv + 0.5)` with half-open bounds `[-0.5,W-0.5)` and `[-0.5,H-0.5)`; exact halfway positions round toward the larger pixel index. Each point contributes to one pixel; sparse projections and disocclusions remain holes.
+- `nearest_surface_winners()` in `forward_warp_utils_pytorch.py` computes the true minimum camera-Z jointly across all selected samples, then chooses the smallest categorical priority among samples within tolerance of that minimum. Comparing against the true minimum avoids chains of near-equal depths. No surface colors are averaged. The private `_resolve_visibility()` method isolates this policy for future replacement.
+- RGB, coverage, and returned depth use one winner. Returned depth is that winner's actual camera-Z, which may exceed the true minimum within tolerance. Diagnostics separately expose `nearest_depth [1,T,1,H,W]` and `winners [1,T,H,W,3]`: `(source index, canonical instance ID, original source pixel index)`. `source_ids` maps indices to sorted source IDs; all winner fields are int64, with `-1` for holes.
+- Child caches and the concatenated selected sample table remain on CPU. Projection transfers point chunks for each target-frame chunk in two passes; GPU projection memory scales with `frame_chunk_size * point_chunk_size`, plus per-chunk visibility buffers and the returned video buffers. Chunk boundaries and registration order do not affect tie priority. Geometry and camera projection use float32; very large coordinate magnitudes retain the precision limitation identified in the placement review.
+
+## Verification and review artifacts
+
+`python -m unittest discover -s tests -q` runs 90 tests: 89 pass and the CUDA parity test skips when no GPU is available. The 14 rendering tests cover projection and camera-Z, rigid camera rotation, identity parity with the existing renderer, cross-source and within-source occlusion, tolerance chains, categorical ties with large integer IDs, invalid geometry, rounding/bounds, empty selections, unequal source sizes, placement, moving cameras, exact chunk equivalence, registration order, RGB ranges, unchanged children, and autocast/default-dtype behavior.
+
+Run `python -m scripts.preview_composite_render --output-dir outputs/composite_preview` to regenerate `preview.png` and `buffers.npz`. The synthetic scene places a checkerboard prop from a second source in front of a blue environment and behind its green foreground post. Three moving-camera views save RGB, depth, coverage, exact winner IDs, and target cameras. The contact sheet has been inspected: the post occludes the prop, the prop occludes the background, and camera-motion disocclusion holes agree across all three buffers. This establishes synthetic geometry behavior; real-source visual quality and CUDA/diffusion inference remain separate validation work.

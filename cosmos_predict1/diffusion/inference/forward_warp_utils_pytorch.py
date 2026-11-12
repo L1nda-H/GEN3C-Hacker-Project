@@ -486,6 +486,54 @@ def project_points(world_points: torch.Tensor, w2c: torch.Tensor, intrinsic: tor
         return projected_points
 
 
+@torch.no_grad()
+def nearest_surface_winners(points, w2cs, intrinsics, image_size, *, depth_tolerance=0., point_chunk_size=65536):
+    """Joint z-buffer for ordered CPU [K,3] points and [T,...] cameras.
+
+    Return [T,H,W] point indices (-1 for holes) and nearest camera-Z (0 for
+    holes). Indices encode caller-supplied tie priority. Candidates within an
+    absolute tolerance of the true minimum compete by smallest index, without
+    averaging. Two passes avoid tolerance chains and chunk-order dependence.
+    Pixels use floor(uv + .5), with half-open bounds [-.5, size-.5).
+    Projection work is bounded by T * point_chunk_size; points stay on CPU.
+    Camera validation and frame chunking belong to the caller.
+    """
+    height, width = image_size
+    frames = len(w2cs)
+    device = w2cs.device
+    nearest = torch.full((frames * height * width,), float('inf'), device=device, dtype=torch.float32)
+    sentinel = len(points)
+    winners = torch.full_like(nearest, sentinel, dtype=torch.int64)
+
+    def candidates(start):
+        chunk = points[start:start + point_chunk_size].to(device=device, dtype=torch.float32)
+        with torch.autocast(device_type=device.type, enabled=False):
+            projected, camera = project_points(
+                chunk[None, None].expand(frames, 1, -1, -1), w2cs, intrinsics, return_cam_points=True,
+            )
+        z = camera[:, 0, :, 2]
+        uv = projected[:, 0, :, :2, 0] / z[..., None]
+        valid = (torch.isfinite(camera[:, 0]).all(-1) & torch.isfinite(uv).all(-1) & (z > 0)
+                 & (uv[..., 0] >= -.5) & (uv[..., 0] < width - .5)
+                 & (uv[..., 1] >= -.5) & (uv[..., 1] < height - .5))
+        frame, point = torch.nonzero(valid, as_tuple=True)
+        xy = torch.floor(uv[frame, point] + .5).long()
+        pixel = frame * (height * width) + xy[:, 1] * width + xy[:, 0]
+        return pixel, z[frame, point], point + start
+
+    for start in range(0, len(points), point_chunk_size):
+        pixel, z, _ = candidates(start)
+        nearest.scatter_reduce_(0, pixel, z, reduce='amin', include_self=True)
+    for start in range(0, len(points), point_chunk_size):
+        pixel, z, rank = candidates(start)
+        eligible = (z - nearest[pixel]) <= depth_tolerance
+        winners.scatter_reduce_(0, pixel[eligible], rank[eligible], reduce='amin', include_self=True)
+    holes = winners == sentinel
+    winners[holes] = -1
+    nearest[holes] = 0
+    return winners.reshape(frames, height, width), nearest.reshape(frames, height, width)
+
+
 def unproject_depth_torch(
     depth1: torch.Tensor,
     transformation1: torch.Tensor,
