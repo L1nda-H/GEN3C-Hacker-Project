@@ -104,6 +104,27 @@ def object_placement(points, source_rows, environment, base_pixel, height):
     return placement, target_z
 
 
+def adjust_object_depth(scene, multiplier):
+    """Move imported sources along first-camera rays, preserving their projection.
+
+    Scaling position and size together changes depth without changing the
+    initial screen position or silhouette. Environment and cameras stay fixed.
+    """
+    if not math.isfinite(multiplier) or multiplier <= 0:
+        raise ValueError("Object depth multiplier must be finite and positive")
+    if multiplier == 1:
+        return
+    camera = scene.cameras(device="cpu")[0][0, 0].double()
+    dilation = torch.eye(4, dtype=torch.float64)
+    dilation[:3, :3] *= multiplier
+    world_dilation = torch.linalg.solve(camera, dilation @ camera)
+    for source in scene.sources:
+        if source.source_id != scene.environment_source:
+            source.source_transform = (world_dilation @ torch.as_tensor(
+                source.source_transform, dtype=torch.float64)).tolist()
+    scene.validate()
+
+
 @torch.inference_mode()
 def export_previews(cache, poses, intrinsics, root):
     """Preview every conditioning buffer; joint RGB is a geometric reference only."""
@@ -160,6 +181,9 @@ def main(argv=None):
                         help="Destination base pixel; default places the candle on the foreground rock")
     parser.add_argument("--object-height", type=float, default=80.,
                         help="Rendered object height in pixels (default: 80)")
+    parser.add_argument("--object-depth-multiplier", type=float, default=1.,
+                        help="Multiply imported object depth and size about the first camera; "
+                             ">1 moves it farther away with the same initial screen size (default: 1)")
     parser.add_argument("--trajectory", choices=("lateral", "forward"), default="lateral",
                         help="Move sideways or forward toward the creature (default: lateral)")
     parser.add_argument("--camera-travel", type=float, default=0.006,
@@ -167,11 +191,16 @@ def main(argv=None):
                              "without an import (default: 0.006)")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/real_cache_mvp"))
     args = parser.parse_args(argv)
+    if not math.isfinite(args.object_depth_multiplier) or args.object_depth_multiplier <= 0:
+        parser.error("--object-depth-multiplier must be finite and positive")
+    if args.object_depth_multiplier != 1 and args.box is None and args.scene_spec is None:
+        parser.error("--object-depth-multiplier requires --box or --scene-spec")
     root = args.output_dir.resolve()
     if args.scene_spec is not None:
         if args.remove_environment_box:
             parser.error("--scene-spec cannot be combined with --remove-environment-box; saved labels are reused")
         scene = SceneSpec.load(args.scene_spec)
+        adjust_object_depth(scene, args.object_depth_multiplier)
         root.mkdir(parents=True, exist_ok=True)
         scene.save(root / "scene.json")
         export_previews(build_composite_scene(scene, device="cpu"), *scene.cameras(), root)
@@ -281,6 +310,7 @@ def main(argv=None):
         target_intrinsics=intrinsics,
         image_size=IMAGE_SIZE,
     )
+    adjust_object_depth(scene, args.object_depth_multiplier)
     scene.save(root / "scene.json")
     cache = build_composite_scene(scene, device="cpu")
 

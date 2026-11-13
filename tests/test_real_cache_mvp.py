@@ -107,6 +107,55 @@ class RealCacheMVPTests(unittest.TestCase):
         self.assertEqual(metadata['conditioning_visibility'], 'joint_nearest_surface')
         self.assertEqual(metadata['depth_tolerance'], cache.depth_tolerance)
 
+    def test_depth_multiplier_places_import_behind_environment_and_reuses_scene(self):
+        scene = self.run_scene('--box', '1', '1', '3', '4', '--target-base', '6', '5',
+                               '--object-height', '3')
+        with np.load(self.root / 'render_000000.npz') as before:
+            self.assertTrue(before['coverage'][0, 0, 1].any())
+        self.sam_loader.reset_mock()
+        self.load.reset_mock()
+        output = self.root / 'behind'
+        with redirect_stdout(io.StringIO()):
+            mvp.main(['--scene-spec', str(self.root / 'scene.json'),
+                      '--object-depth-multiplier', '1.15', '--output-dir', str(output)])
+        self.sam_loader.assert_not_called()
+        self.load.assert_not_called()
+        with np.load(output / 'render_000000.npz') as after:
+            self.assertFalse(after['coverage'][0, 0, 1].any())
+            self.assertTrue((after['rgb'][0, 0, 1] == -1).all())
+        restored = mvp.SceneSpec.load(output / 'scene.json')
+        self.assertEqual(restored.sources[0].source_transform, scene.sources[0].source_transform)
+        torch.testing.assert_close(restored.cameras()[0], scene.cameras()[0])
+        # The same option applies when preparing a fresh import.
+        self.root = self.root / 'fresh'
+        self.run_scene('--box', '1', '1', '3', '4', '--target-base', '6', '5',
+                       '--object-height', '3', '--object-depth-multiplier', '1.15')
+        with np.load(self.root / 'render_000000.npz') as after:
+            self.assertFalse(after['coverage'][0, 0, 1].any())
+
+    def test_depth_adjustment_preserves_projection_with_nonidentity_camera(self):
+        scene = self.run_scene('--box', '1', '1', '3', '4', '--target-base', '6', '5',
+                               '--object-height', '3')
+        pose = torch.eye(4, dtype=torch.float64)
+        pose[:2, :2] = torch.tensor([[0., -1.], [1., 0.]])
+        pose[:3, 3] = torch.tensor([.2, .3, .4])
+        scene.target_w2cs = pose.repeat(1, 24, 1, 1)
+        source = scene.sources[1]
+        source.object_transforms = {1: torch.eye(4)}
+        source.object_transforms[1][0, 3] = .1
+
+        def projected():
+            cache = mvp.build_composite_scene(scene, device='cpu')
+            samples = next(s for s in cache._iter_render_inputs() if s.source_id == 'object')
+            camera_points = samples.points.double() @ pose[:3, :3].T + pose[:3, 3]
+            return camera_points[:, :2] / camera_points[:, 2:], camera_points[:, 2]
+
+        uv_before, z_before = projected()
+        mvp.adjust_object_depth(scene, 1.15)
+        uv_after, z_after = projected()
+        torch.testing.assert_close(uv_after, uv_before, atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(z_after, z_before * 1.15, atol=1e-6, rtol=1e-5)
+
     def test_no_arguments_still_exports_inputs_without_sam(self):
         with redirect_stdout(io.StringIO()):
             mvp.main(['--output-dir', str(self.root)])
@@ -117,6 +166,9 @@ class RealCacheMVPTests(unittest.TestCase):
 
     def test_invalid_boxes_and_saved_scene_removal_fail_before_loading_inputs(self):
         for args in (
+            ['--box', '1', '1', '3', '4', '--object-depth-multiplier', 'nan'],
+            ['--scene-spec', 'unused.json', '--object-depth-multiplier', '0'],
+            ['--object-depth-multiplier', '1.15'],
             ['--remove-environment-box', '3', '1', '1', '3'],
             ['--remove-environment-box', '1', '1', 'nan', '3'],
             ['--remove-environment-box', '1', '1', '8', '3'],

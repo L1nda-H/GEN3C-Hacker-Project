@@ -88,13 +88,38 @@ Combine removal with import, repeating the removal option for multiple objects:
 
 ```bash
 python -m scripts.evaluate_real_cache_mvp \
-  --remove-environment-box 80 40 160 200 \
+  --remove-environment-box 0 60 156 168 \
   --remove-environment-box 200 60 280 180 \
   --box 179 92 232 212 \
   --target-base 235 225 \
   --object-height 160 \
   --output-dir outputs/real_cache_mvp_replacement
 ```
+
+```bash
+python -m scripts.evaluate_real_cache_mvp \
+  --remove-environment-box 0 60 156 168 \
+  --box 179 92 232 212 \
+  --target-base 235 225 \
+  --object-height 160 \
+  --output-dir outputs/real_cache_mvp_replacement
+```
+
+To place the candle behind the foreground mushroom, reuse the saved scene
+and increase its depth while preserving its initial screen position and size:
+
+```bash
+python -m scripts.evaluate_real_cache_mvp \
+  --scene-spec outputs/real_cache_mvp_replacement/scene.json \
+  --object-depth-multiplier 1.15 \
+  --output-dir outputs/real_cache_mvp_behind_mushroom
+```
+
+`--object-depth-multiplier` also works with `--box`. Values above 1 move imported
+sources farther away; values below 1 move them closer. The default 1 preserves
+the existing placement. The environment and camera trajectory stay fixed.
+Occlusion follows the saved depth geometry; increasing depth can hide the entire
+object. Each saved-scene invocation multiplies that scene's current placement.
 
 Removal segments the specified environment objects and leaves their positive
 IDs unselected. Environment ID 0 contains the remaining confirmed pixels.
