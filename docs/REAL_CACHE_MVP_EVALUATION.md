@@ -1,7 +1,8 @@
 # Real-image segmentation and composite cache evaluation
 
-Run real SAM segmentation and render 24 frames from the composite 3D cache on
-CPU. No A100 or GEN3C diffusion checkpoint is required. Run all commands from
+Run real SAM segmentation and render 24 frames from each selected source cache on
+CPU. Preview the separate RGB/mask conditioning buffers, plus a joint-rendered
+reference and initial seed. No A100 or GEN3C diffusion checkpoint is required. Run all commands from
 the repository root. CPU segmentation may take time.
 
 ## 1. Activate the environment and install SAM
@@ -32,13 +33,14 @@ curl -fL \
 
 huggingface-cli download nvidia/GEN3C-Testing-Example \
   --repo-type dataset \
-  --include "batch_0000/*" "batch_0001/*" \
+  --include "batch_0004/*" "batch_0008/*" \
   --local-dir datasets/gen3c_examples
 ```
 
 The [GEN3C samples](https://huggingface.co/datasets/nvidia/GEN3C-Testing-Example/tree/main)
 provide RGB, depth, geometry validity, and cameras. Geometry validity is separate
-from the object mask produced by SAM.
+from the object mask produced by SAM. The script uses `batch_0004` for the
+environment and `batch_0008` for the object source.
 
 ## 3. Run the script to export input previews
 
@@ -77,28 +79,65 @@ python -m scripts.evaluate_real_cache_mvp \
   --trajectory forward \
   --camera-travel 0.08 \
   --output-dir outputs/real_cache_mvp_forward
-  ```
+```
 
 The script runs SAM, saves labels and prepared sources, places the object near
 the destination camera's center of view using a simple depth-based scale and
-translation, and renders a small lateral camera move. Placement is a starting
+translation, and renders a small lateral camera move by default (or a forward
+move with `--trajectory forward`). Placement is a starting
 point for visual review; it does not infer floor contact or physical support.
 
 ## 6. Review the output
 
-Inspect `outputs/real_cache_mvp/`:
+Inspect the selected `--output-dir` (default `outputs/real_cache_mvp/`):
 
 - `object_labels.png`: segmentation overlay.
-- `preview.gif`: 24 rendered camera views.
-- `rgb_*.png`, `depth_*.png`, `coverage_*.png`: per-frame inspection.
-- `render_*.npz`: exact RGB, depth, and coverage buffers.
+- `preview.png`: labeled first-frame contact sheet; `preview.gif`: the same
+  panels over the camera trajectory. Panels show each source buffer followed by
+  the joint geometric reference.
+- `buffer_000.gif`, `buffer_001.gif`: separate source animations. For this
+  script, sorted source IDs give buffer 0 = environment and buffer 1 = object.
+- `rgb_<frame>_buffer_<index>.png`, `depth_<frame>_buffer_<index>.png`,
+  `coverage_<frame>_buffer_<index>.png`: each source's RGB, depth, and validity.
+- `render_<frame>.npz`: exact RGB `[1,1,N,3,H,W]`, depth `[1,1,N,H,W]`, and
+  coverage `[1,1,N,1,H,W]` buffers. Here `N=2`, `H=240`, `W=320`.
+- `joint_reference_<frame>.png`: joint depth-rendered reference, not a fused
+  conditioning buffer or a diffusion prediction.
+- `seed.npy`, `seed.png`: joint-rendered initial image-conditioning seed,
+  with exact normalized array shape `[1,3,1,H,W]`.
+- `preview.json`: ordered source IDs, conditioning strategy, frame count,
+  and image dimensions.
 - `scene.json`: saved composition and camera trajectory.
 - `environment.npz`, `object.npz`, and `*_labels.npz/json`: reusable source artifacts.
 
-For the MVP, check the object's silhouette, recognizability, placement, occlusion,
-and stability across the camera move. Coverage images show holes in the point
-cache. Depth PNGs normalize independently per frame; use NPZ buffers for numeric
-depth comparisons.
+For the MVP, check the object's silhouette, recognizability, placement, and
+stability in its own buffer. Inspect cross-source occlusion in the joint
+reference. The environment intentionally remains visible behind objects in its
+own buffer; no cross-source depth test is applied to conditioning buffers.
+During actual generation, each RGB/mask buffer is encoded independently and
+the latents are concatenated for diffusion. This CPU preview does not execute
+that model or predict its resolution of occlusion.
+
+Coverage images show each source's holes, including gaps that a background
+buffer could otherwise hide. Separate rendering does not itself fill these
+gaps. Depth PNGs normalize independently per frame and buffer; use NPZ buffers
+for numeric depth comparisons. RGB uses [-1,1], holes use RGB -1/depth 0, and
+coverage is binary.
+
+To regenerate previews from saved artifacts without loading SAM or segmenting
+again, use a fresh output directory to avoid mixing old preview filenames:
+
+```bash
+python -m scripts.evaluate_real_cache_mvp \
+  --scene-spec outputs/real_cache_mvp_forward/scene.json \
+  --output-dir outputs/real_cache_mvp_forward_buffers
+```
+
+This renders every camera in the saved trajectory and uses its saved dimensions
+and placement. Original inputs and label overlays remain in the source run's
+directory. Normal GEN3C generation also requires enough checkpoint buffer slots
+for every selected source; this renderer-only preview does not enforce that
+checkpoint limit.
 
 The existing renderer has been exercised on CPU. Real-checkpoint segmentation
 and this complete real-image run still require validation with the downloaded inputs.

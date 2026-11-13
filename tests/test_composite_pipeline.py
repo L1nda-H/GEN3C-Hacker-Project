@@ -111,11 +111,16 @@ class CompositePipelineTests(unittest.TestCase):
         np.testing.assert_array_equal(video[3:], self.segments[1][1:])
         self.assertEqual(prompt, 'final prompt')
         first, second = [call.kwargs for call in self.diffusion.generate.call_args_list]
-        self.assertEqual(first['rendered_warp_images'].shape, (1, 3, 1, 3, self.h, self.w))
-        self.assertEqual(first['rendered_warp_masks'].shape, (1, 3, 1, 1, self.h, self.w))
+        self.assertEqual(first['rendered_warp_images'].shape, (1, 3, 2, 3, self.h, self.w))
+        self.assertEqual(first['rendered_warp_masks'].shape, (1, 3, 2, 1, self.h, self.w))
         self.assertEqual(first['rendered_warp_images'].dtype, torch.float32)
-        torch.testing.assert_close(first['rendered_warp_masks'], torch.ones(1, 3, 1, 1, self.h, self.w))
-        torch.testing.assert_close(first['image_path'], first['rendered_warp_images'][:, 0, 0].unsqueeze(2))
+        masks = first['rendered_warp_masks']
+        self.assertTrue((masks[:, :, 0, :, :, :3] == 1).all())
+        self.assertTrue((masks[:, :, 0, :, :, 3:] == 0).all())
+        self.assertTrue((masks[:, :, 1] == 1).all())
+        # The environment remains available behind the foreground buffer.
+        torch.testing.assert_close(first['rendered_warp_images'][0, :, 1],
+                                   torch.tensor([-1., -1., 1.])[None, :, None, None].expand(3, 3, self.h, self.w))
         self.assertEqual(first['image_path'].shape, (1, 3, 1, self.h, self.w))
         # Selected foreground is red; excluded green object never reaches the seed.
         torch.testing.assert_close(first['image_path'][0, :, 0, :, :3],
@@ -133,6 +138,10 @@ class CompositePipelineTests(unittest.TestCase):
         self.assertFalse(manifest['generated_cache_updates'])
         self.assertEqual(manifest['status'], 'generated')
         self.assertEqual(manifest['seed_coverage'], 1)
+        self.assertEqual(manifest['conditioning_source_ids'], ['objects', 'room'])
+        self.assertEqual(manifest['conditioning_strategy'], 'per_source_latent_concat')
+        np.testing.assert_array_equal(np.load(self.review / 'seed.npy'), first['image_path'])
+        self.assertTrue((self.review / 'rgb_000000_buffer_001.png').is_file())
         self.assertTrue((self.review / 'seed.png').is_file())
         with np.load(self.review / 'render_000000.npz') as arrays:
             self.assertEqual(set(arrays.files), {'rgb', 'depth', 'coverage'})
@@ -294,6 +303,13 @@ class CompositePipelineTests(unittest.TestCase):
             self.generate()
         self.diffusion.generate.assert_not_called()
 
+    def test_buffer_capacity_rejected_before_rendering_or_diffusion(self):
+        self.diffusion.model.frame_buffer_max = 1
+        with self.assertRaisesRegex(ValueError, 'requires 2 conditioning buffers'):
+            self.generate()
+        self.diffusion.generate.assert_not_called()
+        self.assertFalse(self.review.exists())
+
     def test_invalid_artifacts_and_unknown_selections(self):
         scene = deepcopy(self.scene)
         scene.sources[1].selected_ids = [99]
@@ -413,6 +429,19 @@ class CompositePipelineTests(unittest.TestCase):
         torch.testing.assert_close(encoded[:, :3], rgb[:, :, 0].permute(0, 2, 1, 3, 4) + 2)
         torch.testing.assert_close(encoded[:, 3:6], torch.full_like(encoded[:, 3:6], 3))
         torch.testing.assert_close(encoded[:, 6:], torch.zeros_like(encoded[:, 6:]))
+
+        # Exercise the actual multi-buffer encoder with independently rendered caches.
+        buffers = build_composite_scene(self.scene).render_conditioning(*self.scene.cameras())
+        fake.encode.reset_mock()
+        encoded = module.DiffusionGen3CModel.encode_warped_frames(
+            fake, buffers['rgb'], buffers['coverage'], torch.float32)
+        self.assertEqual(fake.encode.call_count, 4)
+        expected = []
+        for index in range(2):
+            expected.append(buffers['rgb'][:, :, index].permute(0, 2, 1, 3, 4) + 2)
+            mask = (buffers['coverage'][:, :, index] * 2 - 1).repeat(1, 1, 3, 1, 1)
+            expected.append(mask.permute(0, 2, 1, 3, 4) + 2)
+        torch.testing.assert_close(encoded, torch.cat(expected, dim=1))
 
 
 if __name__ == '__main__':

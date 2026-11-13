@@ -42,6 +42,45 @@ def composite(environment, *objects, **options):
 
 
 class RenderingTests(unittest.TestCase):
+    def test_conditioning_resolves_occlusion_only_within_each_source(self):
+        env = source('room', [[0, 0, 4]], colors=[[-1, -1, 1]])
+        objects = source('props', [[0, 0, 2], [0, 0, 1], [0, 0, .5]], ids=[1, 2, 3],
+                         colors=[[1, -1, -1], [-1, 1, -1], [1, 1, 1]])
+        scene = composite(env, objects)
+        scene.set_selection('props', [1, 2])
+        baseline = scene.render_conditioning(*cameras(3), include_depth=True)
+        self.assertEqual(scene.conditioning_source_ids, ('props', 'room'))
+        self.assertEqual(baseline['rgb'].shape, (1, 3, 2, 3, 3, 4))
+        torch.testing.assert_close(baseline['depth'][0, :, :, 0, 0], torch.tensor([[1., 4.]] * 3))
+        torch.testing.assert_close(baseline['rgb'][0, 0, :, :, 0, 0],
+                                   torch.tensor([[-1., 1, -1], [-1, -1, 1]]))
+        for frame_chunk, point_chunk in [(1, 1), (5, 100)]:
+            scene.frame_chunk_size, scene.point_chunk_size = frame_chunk, point_chunk
+            rendered = scene.render_conditioning(*cameras(3), include_depth=True)
+            for name in baseline:
+                torch.testing.assert_close(rendered[name], baseline[name], rtol=0, atol=0)
+        self.assertEqual(set(scene.render_conditioning(*cameras())), {'rgb', 'coverage'})
+        # Placement remains active for separate rendering.
+        transform = torch.eye(4)
+        transform[0, 3] = 1
+        scene.set_transform('props', transform, instance_id=2)
+        moved = scene.render_conditioning(*cameras(), include_depth=True)
+        self.assertEqual(moved['depth'][0, 0, 0, 0, 0], 2)
+        self.assertEqual(moved['depth'][0, 0, 0, 0, 1], 1)
+        self.assertEqual(moved['depth'][0, 0, 1, 0, 0], 4)
+
+    def test_conditioning_slots_survive_empty_geometry_but_omit_unselected_sources(self):
+        scene = composite(source('room', [[0, 0, 4]]),
+                          source('props', [[0, 0, 1]], ids=[1], mask=[False]))
+        result = scene.render_conditioning(*cameras(), include_depth=True)
+        self.assertEqual(result['rgb'].shape[2], 2)
+        self.assertTrue((result['rgb'][:, :, 0] == -1).all())
+        self.assertFalse(result['coverage'][:, :, 0].any())
+        self.assertFalse(result['depth'][:, :, 0].any())
+        scene.set_selection('props', [])
+        self.assertEqual(scene.conditioning_source_ids, ('room',))
+        self.assertEqual(scene.render_conditioning(*cameras())['rgb'].shape[2], 1)
+
     def render(self, cache, target=None):
         target = cameras() if target is None else target
         rgb, coverage = cache.render_cache(*target)
@@ -305,6 +344,13 @@ class RenderingTests(unittest.TestCase):
         for left, right in zip(expected, actual):
             self.assertEqual(right.device.type, 'cuda')
             torch.testing.assert_close(left, right.cpu())
+        scene.add_source('prop', source('prop', [[0, 0, .5]], ids=[1]))
+        scene.set_selection('prop', [1])
+        expected = scene.render_conditioning(*cameras(), include_depth=True)
+        actual = scene.render_conditioning(*(t.cuda() for t in cameras()), include_depth=True)
+        for name in expected:
+            self.assertEqual(actual[name].device.type, 'cuda')
+            torch.testing.assert_close(expected[name], actual[name].cpu())
 
 
 if __name__ == '__main__':

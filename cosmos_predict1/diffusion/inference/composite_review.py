@@ -30,13 +30,20 @@ def save_render(directory, start, rendered):
     """Copy review arrays to CPU; do not retain GPU tensors after returning."""
     arrays = {name: value.cpu().numpy() for name, value in rendered.items()}
     np.savez_compressed(directory / f'render_{start:06d}.npz', **arrays)
-    first_rgb = ((arrays['rgb'][0, 0, 0].transpose(1, 2, 0) + 1) * 127.5).round().astype(np.uint8)
-    cv2.imwrite(str(directory / f'rgb_{start:06d}.png'), first_rgb[:, :, ::-1])
-    cv2.imwrite(str(directory / f'coverage_{start:06d}.png'),
-                (arrays['coverage'][0, 0, 0, 0] * 255).astype(np.uint8))
-    z = arrays['depth'][0, 0, 0]
-    cv2.imwrite(str(directory / f'depth_{start:06d}.png'),
-                (z / max(float(z.max()), 1e-8) * 65535).round().astype(np.uint16))
-    if start == 0:
-        np.save(directory / 'seed.npy', arrays['rgb'][:, 0, 0][:, :, None])
-        cv2.imwrite(str(directory / 'seed.png'), first_rgb[:, :, ::-1])
+    for buffer in range(arrays['rgb'].shape[2]):
+        suffix = f'{start:06d}_buffer_{buffer:03d}'
+        first_rgb = ((arrays['rgb'][0, 0, buffer].transpose(1, 2, 0) + 1) * 127.5).round().astype(np.uint8)
+        cv2.imwrite(str(directory / f'rgb_{suffix}.png'), first_rgb[:, :, ::-1])
+        cv2.imwrite(str(directory / f'coverage_{suffix}.png'),
+                    (arrays['coverage'][0, 0, buffer, 0] * 255).astype(np.uint8))
+        z = arrays['depth'][0, 0, buffer]
+        cv2.imwrite(str(directory / f'depth_{suffix}.png'),
+                    (z / max(float(z.max()), 1e-8) * 65535).round().astype(np.uint16))
+
+
+def save_seed(directory, seed):
+    """Save the composed image-conditioning seed separately from source buffers."""
+    array = seed.cpu().numpy()
+    np.save(directory / 'seed.npy', array)
+    rgb = ((array[0, :, 0].transpose(1, 2, 0) + 1) * 127.5).round().astype(np.uint8)
+    cv2.imwrite(str(directory / 'seed.png'), rgb[:, :, ::-1])

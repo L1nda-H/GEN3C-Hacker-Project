@@ -1,8 +1,9 @@
-"""Selection, placement, and joint visibility for static labeled image caches.
+"""Selection, placement, and rendering for static labeled image caches.
 
 The environment defines destination world coordinates. Cameras consuming these
-samples use OpenCV world-to-camera conventions. All sources share one nearest
-surface rasterizer; no child cache tensors are changed by this wrapper.
+samples use OpenCV world-to-camera conventions. Conditioning renders sources
+independently; seed/diagnostic rendering uses joint visibility. Both use the same
+nearest-surface rasterizer; no child cache tensors are changed by this wrapper.
 """
 
 from dataclasses import dataclass
@@ -273,10 +274,10 @@ class Cache3D_Composite:
         with torch.autocast(device_type=poses.device.type, enabled=False):
             return self._render_frames(poses, intrinsics, rgb=rgb, depth=depth, diagnostics=diagnostics)
 
-    def _render_frames(self, poses, intrinsics, *, rgb, depth, diagnostics):
+    def _render_frames(self, poses, intrinsics, *, rgb, depth, diagnostics, samples=None):
         # Iterator order is exactly the categorical tie priority. Release the
         # per-object copies once the flat CPU sample table has been assembled.
-        samples = list(self._iter_render_inputs(include_rgb=rgb))
+        samples = list(self._iter_render_inputs(include_rgb=rgb)) if samples is None else samples
         points = torch.cat([s.points for s in samples]) if samples else torch.empty(0, 3, dtype=torch.float32)
         colors = None
         if rgb:
@@ -361,7 +362,39 @@ class Cache3D_Composite:
         return self._render(target_w2cs, target_intrinsics, start_frame_idx,
                             rgb=include_rgb, depth=True, diagnostics=True)
 
+    @torch.no_grad()
     def render_conditioning(self, target_w2cs, target_intrinsics, start_frame_idx=0, *, include_depth=False):
-        """Render diffusion RGB/coverage and optional review depth, without winner metadata."""
-        return self._render(target_w2cs, target_intrinsics, start_frame_idx,
-                            rgb=True, depth=include_depth, diagnostics=False)
+        """Render one independent buffer per selected source, in source-ID order.
+
+        RGB is [1,T,N,3,H,W], coverage [1,T,N,1,H,W], and optional depth
+        [1,T,N,H,W]. Occlusion is resolved within each source only. Empty
+        geometry retains its buffer slot; sources with no selection are omitted.
+        render_cache/render_diagnostics retain joint visibility for seeds/review.
+        """
+        poses, intrinsics = self._target_cameras(target_w2cs, target_intrinsics, start_frame_idx)
+        source_ids = self.conditioning_source_ids
+        samples = list(self._iter_render_inputs(include_rgb=True))
+        result = {}
+        with torch.autocast(device_type=poses.device.type, enabled=False):
+            for index, source_id in enumerate(source_ids):
+                rendered = self._render_frames(
+                    poses, intrinsics, rgb=True, depth=include_depth, diagnostics=False,
+                    samples=[sample for sample in samples if sample.source_id == source_id],
+                )
+                for name, value in rendered.items():
+                    if name not in result:
+                        shape = list(value.shape)
+                        shape[2] = len(source_ids)
+                        result[name] = value.new_empty(shape)
+                    result[name][:, :, index:index + 1] = value
+                del rendered, value
+        return result
+
+    @property
+    def conditioning_source_ids(self):
+        """Stable buffer ownership, independent of target visibility or geometry validity."""
+        if self.environment_source_id is None:
+            raise ValueError("A designated environment source is required before rendering")
+        for source_id in sorted(self.sources):
+            self._source(source_id)
+        return tuple(source_id for source_id in sorted(self.sources) if self.selections[source_id])

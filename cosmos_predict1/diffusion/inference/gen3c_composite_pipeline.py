@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from cosmos_predict1.diffusion.inference.composite_scene import SceneSpec, build_composite_scene
-from cosmos_predict1.diffusion.inference.composite_review import save_manifest, save_render, source_manifest
+from cosmos_predict1.diffusion.inference.composite_review import save_manifest, save_render, save_seed, source_manifest
 
 
 class Gen3cCompositePipeline:
@@ -42,8 +42,8 @@ class Gen3cCompositePipeline:
             raise ValueError("GEN3C chunk size must be an integer greater than one")
         if getattr(pipeline, 'num_video_frames', chunk_size) != chunk_size:
             raise ValueError("Diffusion num_video_frames must match the model chunk size")
-        # DiffusionGen3CModel.encode_warped_frames encodes the singleton and pads
-        # missing buffers with zero latents up to frame_buffer_max.
+        # The existing encoder handles each RGB/mask buffer independently and
+        # concatenates latents, padding unused checkpoint slots with zeros.
         if type(pipeline.model.frame_buffer_max) is not int or pipeline.model.frame_buffer_max < 1:
             raise ValueError("GEN3C must accept at least one conditioning buffer")
         if (pipeline.height, pipeline.width) != tuple(scene.image_size):
@@ -54,6 +54,10 @@ class Gen3cCompositePipeline:
                 or (num_frames - 1) % (chunk_size - 1)):
             raise ValueError("Trajectory length must cover complete chunks with one-frame overlap")
         composite = build_composite_scene(scene, device=device)
+        buffer_source_ids = composite.conditioning_source_ids
+        if len(buffer_source_ids) > pipeline.model.frame_buffer_max:
+            raise ValueError(f"Scene requires {len(buffer_source_ids)} conditioning buffers, but checkpoint "
+                             f"supports {pipeline.model.frame_buffer_max}; use a compatible checkpoint")
         review_dir = Path(review_dir)
         is_writer = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
         if is_writer:
@@ -69,6 +73,8 @@ class Gen3cCompositePipeline:
                         generation_settings=settings, num_frames=num_frames,
                         chunk_size=chunk_size, frame_buffer_max=pipeline.model.frame_buffer_max,
                         generated_cache_updates=False, seed_hole_fill=-1,
+                        conditioning_source_ids=buffer_source_ids,
+                        conditioning_strategy='per_source_latent_concat',
                         min_seed_coverage=min_seed_coverage)
 
         def record(**changes):
@@ -91,8 +97,14 @@ class Gen3cCompositePipeline:
                     save_render(review_dir, start, rendered)
                 del rendered  # Release review depth before diffusion.
                 if start == 0:
-                    seed = rgb[:, 0, 0].unsqueeze(2).clone()  # [B,C,1,H,W], [-1,1]
-                    record(seed_coverage=float(coverage[:, 0].mean()))
+                    # The image-conditioning input still needs one composed image.
+                    # Joint visibility is used only for this seed, never for buffers.
+                    seed_rgb, seed_mask = composite.render_cache(poses[:, :1], intrinsics[:, :1])
+                    seed = seed_rgb[:, 0, 0].unsqueeze(2).clone()
+                    record(seed_coverage=float(seed_mask.mean()))
+                    if is_writer:
+                        save_seed(review_dir, seed)
+                    del seed_rgb, seed_mask
                     if manifest['seed_coverage'] < min_seed_coverage:
                         raise ValueError("Initial composed seed has insufficient coverage; choose a better starting camera")
                 else:

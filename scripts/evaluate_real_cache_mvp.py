@@ -8,14 +8,15 @@ See docs/REAL_CACHE_MVP_EVALUATION.md for setup and downloads.
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 
-from cosmos_predict1.diffusion.inference.composite_review import save_render
+from cosmos_predict1.diffusion.inference.composite_review import save_render, save_seed
 from cosmos_predict1.diffusion.inference.composite_scene import (
     SceneSource,
     SceneSpec,
@@ -98,9 +99,52 @@ def object_placement(points, source_rows, environment, base_pixel, height):
 
 
 @torch.inference_mode()
+def export_previews(cache, poses, intrinsics, root):
+    """Preview every conditioning buffer; joint RGB is a geometric reference only."""
+    root.mkdir(parents=True, exist_ok=True)
+    source_ids = cache.conditioning_source_ids
+    frames = []
+    buffer_frames = [[] for _ in source_ids]
+    height, width = cache.image_size
+    for i in range(poses.shape[1]):
+        rendered = cache.render_conditioning(
+            poses[:, i:i + 1], intrinsics[:, i:i + 1], start_frame_idx=i, include_depth=True,
+        )
+        save_render(root, i, rendered)
+        # This joint image is not sent as a conditioning buffer to diffusion.
+        joint, _ = cache.render_cache(poses[:, i:i + 1], intrinsics[:, i:i + 1], start_frame_idx=i)
+        joint_image = rgb_image(joint[0, 0, 0])
+        joint_image.save(root / f"joint_reference_{i:06d}.png")
+        if i == 0:
+            save_seed(root, joint[:, 0, 0].unsqueeze(2))
+        sheet = Image.new("RGB", ((len(source_ids) + 1) * width, height + 24), "#202020")
+        draw = ImageDraw.Draw(sheet)
+        for index, source_id in enumerate(source_ids):
+            image = rgb_image(rendered["rgb"][0, 0, index])
+            buffer_frames[index].append(image)
+            draw.text((index * width + 4, 4), f"Buffer {index}: {source_id}", fill="white")
+            sheet.paste(image, (index * width, 24))
+        draw.text((len(source_ids) * width + 4, 4), "Joint reference (seed at frame 0)", fill="white")
+        sheet.paste(joint_image, (len(source_ids) * width, 24))
+        frames.append(sheet)
+    frames[0].save(root / "preview.png")
+    frames[0].save(root / "preview.gif", save_all=True, append_images=frames[1:], duration=100, loop=0)
+    for index, images in enumerate(buffer_frames):
+        images[0].save(root / f"buffer_{index:03d}.gif", save_all=True,
+                       append_images=images[1:], duration=100, loop=0)
+    metadata = dict(conditioning_source_ids=source_ids, conditioning_strategy="per_source_latent_concat",
+                    num_frames=len(frames), image_size=cache.image_size,
+                    joint_reference="Geometric preview only; frame 0 supplies the image-conditioning seed")
+    (root / "preview.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    print(f"Saved per-source buffers, seed, and preview.gif to {root}")
+
+
+@torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--box", nargs=4, type=float, metavar=("X1", "Y1", "X2", "Y2"))
+    inputs = parser.add_mutually_exclusive_group()
+    inputs.add_argument("--box", nargs=4, type=float, metavar=("X1", "Y1", "X2", "Y2"))
+    inputs.add_argument("--scene-spec", type=Path, help="Render an existing scene JSON without rerunning SAM")
     parser.add_argument("--target-base", nargs=2, type=int, default=(275, 225), metavar=("U", "V"),
                         help="Destination base pixel; default places the candle on the foreground rock")
     parser.add_argument("--object-height", type=float, default=80.,
@@ -111,11 +155,17 @@ def main():
                         help="Camera travel as a fraction of placement depth (default: 0.006)")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/real_cache_mvp"))
     args = parser.parse_args()
+    root = args.output_dir.resolve()
+    if args.scene_spec is not None:
+        scene = SceneSpec.load(args.scene_spec)
+        root.mkdir(parents=True, exist_ok=True)
+        scene.save(root / "scene.json")
+        export_previews(build_composite_scene(scene, device="cpu"), *scene.cameras(), root)
+        return
     if not (0 <= args.target_base[0] < IMAGE_SIZE[1] and 0 <= args.target_base[1] < IMAGE_SIZE[0]):
         parser.error("--target-base must be inside the 320 x 240 destination image")
     if args.object_height <= 0 or args.camera_travel < 0:
         parser.error("--object-height must be positive and --camera-travel nonnegative")
-    root = args.output_dir.resolve()
     root.mkdir(parents=True, exist_ok=True)
 
     sources = {
@@ -192,18 +242,7 @@ def main():
     scene.save(root / "scene.json")
     cache = build_composite_scene(scene, device="cpu")
 
-    frames = []
-    for i in range(24):
-        rendered = cache.render_conditioning(
-            poses[:, i:i + 1], intrinsics[:, i:i + 1], include_depth=True,
-        )
-        save_render(root, i, rendered)
-        frames.append(rgb_image(rendered["rgb"][0, 0, 0]))
-    frames[0].save(
-        root / "preview.gif", save_all=True,
-        append_images=frames[1:], duration=100, loop=0,
-    )
-    print(f"Saved renders and preview.gif to {root}")
+    export_previews(cache, poses, intrinsics, root)
 
 
 if __name__ == "__main__":
