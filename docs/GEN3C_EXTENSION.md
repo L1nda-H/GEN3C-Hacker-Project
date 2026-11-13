@@ -6,6 +6,12 @@
 - MVP: single-view images. Temporarily defer geometric multiview association (step 3 of the detailed plan); retain its requirements for later support. Still images bypass video propagation, while clips use SAM 2.1 tracking before labeling.
 - Assume that pipeline will be run on GCP hardware.
 
+## ToDos:
+- [P0] Integrate composite cache with GUI
+- [P1] Render objects in scenes with depth (objects in foreground should cover inserted object)
+- [P2] Fix object holes from sparse point clouds when object moves closer to camera
+    - Possible approaches: adaptive splatting, fill in holes with coverage mask
+
 ## Inputs and outputs
 
 - Accept single images, multiview images, and videos as source scenes.

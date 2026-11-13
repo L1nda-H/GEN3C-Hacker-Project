@@ -32,6 +32,15 @@ class CompositeSamples:
     pixel_indices: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _SampleTable:
+    """Private CPU storage; never returned to callers as mutable samples."""
+
+    points: torch.Tensor
+    colors: torch.Tensor | None
+    metadata: torch.Tensor | None
+
+
 class Cache3D_Composite:
     """Compose B=F=N=V=1 caches with one shared RGB range (GEN3C: [-1,1]).
 
@@ -42,6 +51,8 @@ class Cache3D_Composite:
     Rendering requires image_size=(H,W). Depth ties within depth_tolerance
     destination units use source ID, canonical object ID, then source pixel.
     Frame/point chunks bound projection memory; outputs use the camera device.
+    Private CPU sample tables persist across renders. Change selections and
+    placement through setters; call refresh_source after direct child edits.
     """
 
     def __init__(self, *, rgb_range=(-1., 1.), image_size=None, depth_tolerance=1e-5,
@@ -70,6 +81,16 @@ class Cache3D_Composite:
         self._attachments = {}
         self._label_states = {}
         self._placement_conflicts = set()
+        self._sample_tables = {}
+        self._joint_table = None
+        self._table_rgb_range = self.rgb_range
+
+    def _invalidate_samples(self, source_id=None):
+        if source_id is None:
+            self._sample_tables.clear()
+        else:
+            self._sample_tables.pop(source_id, None)
+        self._joint_table = None
 
     @staticmethod
     def _identity():
@@ -155,6 +176,7 @@ class Cache3D_Composite:
         self.object_transforms.update({(source_id, i): matrix for i, matrix in placements.items()})
         self._placement_conflicts = {key for key in self._placement_conflicts if key[0] != source_id} | conflicts
         self._label_states[source_id] = self._label_state(cache)
+        self._invalidate_samples(source_id)
 
     def _source(self, source_id):
         if source_id not in self.sources:
@@ -180,6 +202,8 @@ class Cache3D_Composite:
         self._label_states[source_id] = self._label_state(cache)
         if is_environment:
             self.environment_source_id = source_id
+        # Adding a source can change diagnostic source indices.
+        self._invalidate_samples()
 
     def _resolve(self, source_id, instance_id, cache):
         if type(instance_id) is not int or instance_id < 0:
@@ -196,7 +220,10 @@ class Cache3D_Composite:
         selected = {self._resolve(source_id, i, cache) for i in instance_ids}
         if source_id == self.environment_source_id:
             selected.add(0)
-        self.selections[source_id] = frozenset(selected)
+        selected = frozenset(selected)
+        if self.selections[source_id] != selected:
+            self.selections[source_id] = selected
+            self._invalidate_samples(source_id)
 
     def set_transform(self, source_id, matrix, instance_id=None):
         """Set source placement or one positive object's source-space placement."""
@@ -205,15 +232,21 @@ class Cache3D_Composite:
         if instance_id is None:
             if source_id == self.environment_source_id and not torch.equal(matrix, self._identity()):
                 raise ValueError("Environment source transform must stay at identity")
-            self.source_transforms[source_id] = matrix
+            if not torch.equal(self.source_transforms[source_id], matrix):
+                self.source_transforms[source_id] = matrix
+                self._invalidate_samples(source_id)
         else:
             instance_id = self._resolve(source_id, instance_id, cache)
             if instance_id == 0:
                 raise ValueError("Cannot transform environment ID 0")
-            self.object_transforms[source_id, instance_id] = matrix
-            self._placement_conflicts.discard((source_id, instance_id))
+            key = (source_id, instance_id)
+            if (key in self._placement_conflicts or
+                    not torch.equal(self.object_transforms.get(key, self._identity()), matrix)):
+                self._invalidate_samples(source_id)
+            self.object_transforms[key] = matrix
+            self._placement_conflicts.discard(key)
 
-    def _iter_render_inputs(self, *, include_rgb=True):
+    def _iter_render_inputs(self, *, include_rgb=True, source_ids=None):
         """Yield selected valid samples in deterministic source/object order.
 
         Check attachments and refresh changed label snapshots before yielding. A
@@ -224,7 +257,7 @@ class Cache3D_Composite:
         if self.environment_source_id is None:
             raise ValueError("A designated environment source is required before rendering")
         inputs = []
-        for source_id in sorted(self.sources):
+        for source_id in sorted(self.sources) if source_ids is None else source_ids:
             cache = self._source(source_id)
             selected = self.selections[source_id]
             if any((source_id, i) in self._placement_conflicts for i in selected):
@@ -274,25 +307,67 @@ class Cache3D_Composite:
         with torch.autocast(device_type=poses.device.type, enabled=False):
             return self._render_frames(poses, intrinsics, rgb=rgb, depth=depth, diagnostics=diagnostics)
 
-    def _render_frames(self, poses, intrinsics, *, rgb, depth, diagnostics, samples=None):
-        # Iterator order is exactly the categorical tie priority. Release the
-        # per-object copies once the flat CPU sample table has been assembled.
-        samples = list(self._iter_render_inputs(include_rgb=rgb)) if samples is None else samples
-        points = torch.cat([s.points for s in samples]) if samples else torch.empty(0, 3, dtype=torch.float32)
-        colors = None
-        if rgb:
-            colors = torch.cat([s.rgb.float() for s in samples]) if samples else torch.empty(0, 3, dtype=torch.float32)
-            if self.rgb_range != (-1., 1.):
-                colors = (colors - self.rgb_range[0]) * (2 / (self.rgb_range[1] - self.rgb_range[0])) - 1
+    @staticmethod
+    def _supports(table, rgb, diagnostics):
+        return (table is not None and (not rgb or table.colors is not None)
+                and (not diagnostics or table.metadata is not None))
+
+    def _render_tables(self, *, rgb, diagnostics):
+        # Always check live attachment/label state, even on cache hits. Refreshes
+        # invalidate tables and preserve label-merge placement conflict errors.
+        source_ids = self.conditioning_source_ids
+        for source_id in source_ids:
+            if any((source_id, i) in self._placement_conflicts for i in self.selections[source_id]):
+                raise ValueError("Merged objects have conflicting transforms; call set_transform again")
+        if self._table_rgb_range != self.rgb_range:
+            self._invalidate_samples()
+            self._table_rgb_range = self.rgb_range
+        source_index = {name: i for i, name in enumerate(sorted(self.sources))}
+        for source_id in source_ids:
+            previous = self._sample_tables.get(source_id)
+            if self._supports(previous, rgb, diagnostics):
+                continue
+            # Retain already requested attributes when upgrading a depth table.
+            include_rgb = rgb or (previous is not None and previous.colors is not None)
+            include_metadata = diagnostics or (previous is not None and previous.metadata is not None)
+            samples = list(self._iter_render_inputs(include_rgb=include_rgb, source_ids=(source_id,)))
+            points = torch.cat([s.points for s in samples]) if samples else torch.empty(0, 3, dtype=torch.float32)
+            colors = None
+            if include_rgb:
+                colors = torch.cat([s.rgb.float() for s in samples]) if samples else torch.empty(0, 3, dtype=torch.float32)
+                if self.rgb_range != (-1., 1.):
+                    colors = (colors - self.rgb_range[0]) * (2 / (self.rgb_range[1] - self.rgb_range[0])) - 1
+            metadata = None
+            if include_metadata:
+                metadata = torch.cat([
+                    torch.stack([torch.full_like(s.pixel_indices, source_index[source_id]),
+                                 torch.full_like(s.pixel_indices, s.instance_id), s.pixel_indices], dim=-1)
+                    for s in samples
+                ]) if samples else torch.empty(0, 3, dtype=torch.int64)
+            self._sample_tables[source_id] = _SampleTable(points, colors, metadata)
+            self._joint_table = None
+        return source_ids
+
+    def _joint_render_table(self, *, rgb, diagnostics):
+        source_ids = self._render_tables(rgb=rgb, diagnostics=diagnostics)
+        if not self._supports(self._joint_table, rgb, diagnostics):
+            tables = [self._sample_tables[source_id] for source_id in source_ids]
+            # A single source needs no additional copies.
+            if len(tables) == 1:
+                self._joint_table = tables[0]
+            else:
+                self._joint_table = _SampleTable(
+                    torch.cat([t.points for t in tables]),
+                    torch.cat([t.colors for t in tables]) if rgb else None,
+                    torch.cat([t.metadata for t in tables]) if diagnostics else None,
+                )
+        return self._joint_table
+
+    def _render_frames(self, poses, intrinsics, *, rgb, depth, diagnostics, table=None):
+        table = self._joint_render_table(rgb=rgb, diagnostics=diagnostics) if table is None else table
+        points, colors, metadata = table.points, table.colors, table.metadata
         if diagnostics:
             source_ids = tuple(sorted(self.sources))
-            source_index = {source_id: i for i, source_id in enumerate(source_ids)}
-            metadata = torch.cat([
-                torch.stack([torch.full_like(s.pixel_indices, source_index[s.source_id]),
-                             torch.full_like(s.pixel_indices, s.instance_id), s.pixel_indices], dim=-1)
-                for s in samples
-            ]) if samples else torch.empty(0, 3, dtype=torch.int64)
-        del samples
 
         frames, (height, width) = len(poses), self.image_size
         pixels = height * width
@@ -372,14 +447,13 @@ class Cache3D_Composite:
         render_cache/render_diagnostics retain joint visibility for seeds/review.
         """
         poses, intrinsics = self._target_cameras(target_w2cs, target_intrinsics, start_frame_idx)
-        source_ids = self.conditioning_source_ids
-        samples = list(self._iter_render_inputs(include_rgb=True))
         result = {}
         with torch.autocast(device_type=poses.device.type, enabled=False):
+            source_ids = self._render_tables(rgb=True, diagnostics=False)
             for index, source_id in enumerate(source_ids):
                 rendered = self._render_frames(
                     poses, intrinsics, rgb=True, depth=include_depth, diagnostics=False,
-                    samples=[sample for sample in samples if sample.source_id == source_id],
+                    table=self._sample_tables[source_id],
                 )
                 for name, value in rendered.items():
                     if name not in result:

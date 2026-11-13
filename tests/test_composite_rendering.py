@@ -1,6 +1,7 @@
 """Joint visibility contracts, using explicit synthetic world geometry on CPU."""
 
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -295,6 +296,7 @@ class RenderingTests(unittest.TestCase):
         # Also exercise the optional buffers for a scene without valid samples.
         scene.set_selection('room', [])  # environment stays selected
         scene.sources['room'].input_mask.zero_()
+        scene.refresh_source('room')  # Direct child edits require an explicit refresh.
         empty = scene.render_diagnostics(*target, include_rgb=True)
         self.assertTrue((empty['rgb'] == -1).all())
         self.assertFalse(empty['coverage'].any())
@@ -335,6 +337,95 @@ class RenderingTests(unittest.TestCase):
         torch.testing.assert_close(details['depth'], depth, rtol=0, atol=0)
         self.assertTrue(gathers)
         self.assertLessEqual(max(gathers), scene.point_chunk_size)
+
+    def test_static_tables_reused_across_chunks_and_render_modes(self):
+        scene = composite(source('room', [[0, 0, 4]]),
+                          source('props', [[0, 0, 1]], ids=[1]))
+        with patch.object(scene, '_iter_render_inputs', wraps=scene._iter_render_inputs) as gather:
+            baseline = scene.render_conditioning(*cameras(3), include_depth=True)
+            tables = dict(scene._sample_tables)
+            for start in (3, 6):
+                actual = scene.render_conditioning(*cameras(3), start_frame_idx=start, include_depth=True)
+                for name in baseline:
+                    torch.testing.assert_close(actual[name], baseline[name], rtol=0, atol=0)
+            scene.render_cache(*cameras())
+            joint = scene._joint_table
+            scene.render_cache(*cameras(), render_depth=True)
+            self.assertIs(scene._joint_table, joint)
+            self.assertEqual(gather.call_count, 2)  # Once for each source.
+            for name, table in tables.items():
+                self.assertIs(scene._sample_tables[name], table)
+            # Assigning the same selection/placement should also remain a hit.
+            scene.set_selection('props', [1])
+            scene.set_transform('props', torch.eye(4), instance_id=1)
+            scene.render_conditioning(*cameras())
+            self.assertEqual(gather.call_count, 2)
+            move = torch.eye(4)
+            move[0, 3] = 1
+            scene.set_transform('props', move, instance_id=1)
+            moved = scene.render_conditioning(*cameras(), include_depth=True)
+            self.assertEqual(gather.call_count, 3)
+            self.assertIs(scene._sample_tables['room'], tables['room'])
+            self.assertEqual(moved['coverage'][0, 0, 0, 0, 0, 0], 0)
+            self.assertEqual(moved['coverage'][0, 0, 0, 0, 0, 1], 1)
+            scene.set_selection('props', [])
+            self.assertEqual(scene.render_conditioning(*cameras())['rgb'].shape[2], 1)
+            self.assertEqual(gather.call_count, 3)
+
+    def test_cached_tables_refresh_labels_and_explicit_child_edits(self):
+        props = source('props', [[0, 0, 1], [1, 0, 1]], ids=[1, 2])
+        scene = composite(source('room', [[0, 0, 4]]), props)
+        scene.set_selection('props', [1])
+        scene.render_conditioning(*cameras())
+        props.input_labels = torch.tensor([2, 1]).reshape_as(props.input_labels)
+        moved = scene.render_conditioning(*cameras())
+        self.assertEqual(moved['coverage'][0, 0, 0, 0, 0, 0], 0)
+        self.assertEqual(moved['coverage'][0, 0, 0, 0, 0, 1], 1)
+        props.input_image.fill_(-.5)
+        scene.refresh_source('props')
+        refreshed = scene.render_conditioning(*cameras())
+        torch.testing.assert_close(refreshed['rgb'][0, 0, 0, :, 0, 1], torch.full((3,), -.5))
+        props.geometry_revision += 1
+        with self.assertRaisesRegex(ValueError, 'attachment'):
+            scene.render_cache(*cameras())
+
+    def test_cached_tables_preserve_merge_conflicts(self):
+        props = source('props', [[0, 0, 1], [1, 0, 1]], ids=[1, 2])
+        scene = composite(source('room', [[0, 0, 4]]), props)
+        move = torch.eye(4)
+        move[0, 3] = 1
+        scene.set_transform('props', move, instance_id=1)
+        scene.render_conditioning(*cameras())
+        # Explicitly differing placements must still fail after a cached render.
+        scene.set_transform('props', torch.eye(4), instance_id=2)
+        props.object_registry.merge_ids(1, 2)
+        props.input_labels[props.input_labels == 1] = 2
+        with self.assertRaisesRegex(ValueError, 'conflicting transforms'):
+            scene.render_conditioning(*cameras())
+        scene.set_transform('props', torch.eye(4), instance_id=2)
+        scene.render_conditioning(*cameras())
+
+    def test_depth_table_upgrades_and_new_source_reindexes_diagnostics(self):
+        scene = composite(source('room', [[0, 0, 2]]))
+        depth, coverage = scene.render_cache(*cameras(), render_depth=True)
+        self.assertIsNone(scene._sample_tables['room'].colors)
+        self.assertIsNone(scene._sample_tables['room'].metadata)
+        details = scene.render_diagnostics(*cameras(), include_rgb=True)
+        torch.testing.assert_close(details['depth'], depth, rtol=0, atol=0)
+        torch.testing.assert_close(details['coverage'], coverage, rtol=0, atol=0)
+        self.assertEqual(details['winners'][0, 0, 0, 0, 0], 0)
+        scene.add_source('a', source('a', [[1, 0, 1]], ids=[1]))
+        scene.set_selection('a', [1])
+        details = scene.render_diagnostics(*cameras(), include_rgb=True)
+        self.assertEqual(details['source_ids'], ('a', 'room'))
+        self.assertEqual(details['winners'][0, 0, 0, 0, 0], 1)
+        # Cached samples must not escape through the public iterator.
+        sample = next(s for s in scene._iter_render_inputs() if s.source_id == 'room')
+        sample.points.fill_(99)
+        sample.rgb.fill_(99)
+        again = scene.render_diagnostics(*cameras(), include_rgb=True)
+        for name in ('rgb', 'depth', 'winners'):
+            torch.testing.assert_close(again[name], details[name], rtol=0, atol=0)
 
     @unittest.skipUnless(torch.cuda.is_available(), 'CUDA unavailable')
     def test_cuda_device_and_cpu_parity(self):

@@ -7,7 +7,7 @@ import subprocess
 
 import torch
 
-from cosmos_predict1.diffusion.inference.composite_scene import SceneSpec
+from cosmos_predict1.diffusion.inference.composite_scene import SceneSpec, build_composite_scene
 from cosmos_predict1.diffusion.inference.gen3c_composite_pipeline import Gen3cCompositePipeline
 
 
@@ -117,12 +117,13 @@ def _save_generations(args, pipeline, scene, device, *, prompts=None):
     if is_writer:
         for source in scene.to_dict()['sources']:
             log.info(f'Composite source: {json.dumps(source)}')
+    composite = build_composite_scene(scene, device=device)
     for index, entry in enumerate(prompts):
         prompt = entry.get('prompt')
         name = str(index) if args.batch_input_path else args.video_save_name
         review_dir = output_dir / f'{name}_review'
         output = composite_pipeline.generate(
-            scene, prompt=prompt, negative_prompt=args.negative_prompt,
+            scene, prompt=prompt, negative_prompt=args.negative_prompt, prepared_composite=composite,
             num_frames=args.num_video_frames, device=device, review_dir=review_dir,
             generation_settings=settings, min_seed_coverage=getattr(args, 'min_seed_coverage', 0.5),
         )

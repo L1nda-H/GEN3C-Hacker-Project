@@ -236,10 +236,11 @@ class CompositePipelineTests(unittest.TestCase):
         scene = replace(self.scene, target_w2cs=torch.eye(4).repeat(1, 121, 1, 1),
                         target_intrinsics=torch.eye(3).repeat(1, 121, 1, 1))
         factory = Mock()
+        model_config = importlib.import_module('cosmos_predict1.utils.model_config')
         with patch.dict(sys.modules, {
             'cosmos_predict1.diffusion.inference.gen3c_pipeline': SimpleNamespace(Gen3cPipeline=factory),
             'cosmos_predict1.utils.misc': SimpleNamespace(set_random_seed=Mock()),
-        }), patch('cosmos_predict1.utils.model_config.model_config_session', return_value=nullcontext()) as session, \
+        }), patch.object(model_config, 'model_config_session', return_value=nullcontext()) as session, \
                 patch('cosmos_predict1.diffusion.inference.gen3c_composite._save_generations'):
             demo(args, scene)
         session.assert_called_once_with()
@@ -406,6 +407,34 @@ class CompositePipelineTests(unittest.TestCase):
         self.assertEqual(manifest['status'], 'saved')
         self.assertEqual(manifest['generation_settings']['checkpoint_revision'], 'abc123')
         self.assertTrue(manifest['final_video'].endswith('result.mp4'))
+
+    def test_batch_prompts_build_one_composite_and_reuse_source_tables(self):
+        args = SimpleNamespace(batch_input_path='batch.jsonl', negative_prompt=None,
+                               video_save_folder=str(self.root / 'outputs'),
+                               checkpoint_dir=str(self.root / 'checkpoints'), checkpoint_revision='abc123',
+                               num_video_frames=5, fps=24, height=self.h, width=self.w)
+        self.diffusion.generate.side_effect = [(v, 'final prompt') for v in self.segments * 2]
+        composite = build_composite_scene(self.scene)
+        io_module = SimpleNamespace(save_video=Mock())
+        with patch.dict(sys.modules, {'cosmos_predict1.utils.io': io_module}), \
+                patch('cosmos_predict1.diffusion.inference.gen3c_composite.build_composite_scene',
+                      return_value=composite) as build, \
+                patch('cosmos_predict1.diffusion.inference.gen3c_composite_pipeline.build_composite_scene') as rebuild, \
+                patch.object(composite, '_iter_render_inputs', wraps=composite._iter_render_inputs) as gather:
+            _save_generations(args, self.diffusion, self.scene, 'cpu',
+                              prompts=[{'prompt': 'first'}, {'prompt': 'second'}])
+        build.assert_called_once_with(self.scene, device='cpu')
+        rebuild.assert_not_called()
+        self.assertEqual(gather.call_count, 2)
+        self.assertEqual(io_module.save_video.call_count, 2)
+        calls = self.diffusion.generate.call_args_list
+        for first, second in zip(calls[:2], calls[2:]):
+            for name in ('rendered_warp_images', 'rendered_warp_masks', 'image_path'):
+                torch.testing.assert_close(first.kwargs[name], second.kwargs[name], rtol=0, atol=0)
+        for index, prompt in enumerate(('first', 'second')):
+            manifest = json.loads((self.root / 'outputs' / f'{index}_review' / 'generation.json').read_text())
+            self.assertEqual(manifest['prompt'], prompt)
+            self.assertEqual(manifest['status'], 'saved')
 
     def test_real_model_encoder_accepts_singleton_and_pads_zero_latents(self):
         # Load the actual model module with training/distributed imports stubbed;

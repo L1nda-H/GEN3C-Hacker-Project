@@ -23,13 +23,15 @@ class Gen3cCompositePipeline:
     @torch.no_grad()
     def generate(self, scene: SceneSpec, *, prompt, negative_prompt=None,
                  num_frames=None, device='cuda', review_dir,
-                 generation_settings=None, min_seed_coverage=0.5):
+                 generation_settings=None, min_seed_coverage=0.5, prepared_composite=None):
         """Return normal pipeline output, or None if any chunk is guardrail-blocked.
 
         The first trajectory camera must be well covered; choose it when authoring
         the scene. Holes in the separate seed path are deterministic black (-1),
         exactly as rendered. Only warp conditioning has an accompanying mask.
         Later chunks use the preceding generated frame and overlap by one frame.
+        prepared_composite may supply a validated snapshot of this scene for a
+        batch of prompts. Source artifacts must remain unchanged during the batch.
         """
         pipeline = self.diffusion_pipeline
         if not isinstance(prompt, str) or not prompt.strip():
@@ -53,7 +55,8 @@ class Gen3cCompositePipeline:
         if (type(num_frames) is not int or num_frames < chunk_size or num_frames > poses.shape[1]
                 or (num_frames - 1) % (chunk_size - 1)):
             raise ValueError("Trajectory length must cover complete chunks with one-frame overlap")
-        composite = build_composite_scene(scene, device=device)
+        composite = (build_composite_scene(scene, device=device)
+                     if prepared_composite is None else prepared_composite)
         buffer_source_ids = composite.conditioning_source_ids
         if len(buffer_source_ids) > pipeline.model.frame_buffer_max:
             raise ValueError(f"Scene requires {len(buffer_source_ids)} conditioning buffers, but checkpoint "
