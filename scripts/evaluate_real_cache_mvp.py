@@ -3,12 +3,17 @@
 Run from the repository root:
     python -m scripts.evaluate_real_cache_mvp
     python -m scripts.evaluate_real_cache_mvp --box X1 Y1 X2 Y2
+    python -m scripts.evaluate_real_cache_mvp --remove-environment-box X1 Y1 X2 Y2
+
+Combine --box with --remove-environment-box to import and remove objects together.
+Repeat --remove-environment-box to remove multiple environment objects.
 
 See docs/REAL_CACHE_MVP_EVALUATION.md for setup and downloads.
 """
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import cv2
@@ -140,11 +145,15 @@ def export_previews(cache, poses, intrinsics, root):
 
 
 @torch.inference_mode()
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     inputs = parser.add_mutually_exclusive_group()
-    inputs.add_argument("--box", nargs=4, type=float, metavar=("X1", "Y1", "X2", "Y2"))
+    inputs.add_argument("--box", nargs=4, type=float, metavar=("X1", "Y1", "X2", "Y2"),
+                        help="Segment and import an object from object_input.png (optional)")
     inputs.add_argument("--scene-spec", type=Path, help="Render an existing scene JSON without rerunning SAM")
+    parser.add_argument("--remove-environment-box", nargs=4, type=float, action="append", default=[],
+                        metavar=("X1", "Y1", "X2", "Y2"),
+                        help="Segment and exclude an object from environment_input.png; repeat for multiple objects")
     parser.add_argument("--target-base", nargs=2, type=int, default=(275, 225), metavar=("U", "V"),
                         help="Destination base pixel; default places the candle on the foreground rock")
     parser.add_argument("--object-height", type=float, default=80.,
@@ -152,30 +161,44 @@ def main():
     parser.add_argument("--trajectory", choices=("lateral", "forward"), default="lateral",
                         help="Move sideways or forward toward the creature (default: lateral)")
     parser.add_argument("--camera-travel", type=float, default=0.006,
-                        help="Camera travel as a fraction of placement depth (default: 0.006)")
+                        help="Camera travel as a fraction of placement depth, or median valid environment depth "
+                             "without an import (default: 0.006)")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/real_cache_mvp"))
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     root = args.output_dir.resolve()
     if args.scene_spec is not None:
+        if args.remove_environment_box:
+            parser.error("--scene-spec cannot be combined with --remove-environment-box; saved labels are reused")
         scene = SceneSpec.load(args.scene_spec)
         root.mkdir(parents=True, exist_ok=True)
         scene.save(root / "scene.json")
         export_previews(build_composite_scene(scene, device="cpu"), *scene.cameras(), root)
         return
-    if not (0 <= args.target_base[0] < IMAGE_SIZE[1] and 0 <= args.target_base[1] < IMAGE_SIZE[0]):
-        parser.error("--target-base must be inside the 320 x 240 destination image")
-    if args.object_height <= 0 or args.camera_travel < 0:
-        parser.error("--object-height must be positive and --camera-travel nonnegative")
+    for flag, boxes in (("--box", [] if args.box is None else [args.box]),
+                        ("--remove-environment-box", args.remove_environment_box)):
+        for x1, y1, x2, y2 in boxes:
+            if not (all(math.isfinite(value) for value in (x1, y1, x2, y2))
+                    and 0 <= x1 < x2 <= IMAGE_SIZE[1] - 1
+                    and 0 <= y1 < y2 <= IMAGE_SIZE[0] - 1):
+                parser.error(f"{flag} requires ordered XYXY coordinates inside the 320 x 240 preview")
+    if args.box is not None:
+        if not (0 <= args.target_base[0] < IMAGE_SIZE[1] and 0 <= args.target_base[1] < IMAGE_SIZE[0]):
+            parser.error("--target-base must be inside the 320 x 240 destination image")
+        if not math.isfinite(args.object_height) or args.object_height <= 0:
+            parser.error("--object-height must be finite and positive")
+    if not math.isfinite(args.camera_travel) or args.camera_travel < 0:
+        parser.error("--camera-travel must be finite and nonnegative")
     root.mkdir(parents=True, exist_ok=True)
 
-    sources = {
-        "environment": load_source("batch_0004"),
-        "object": load_source("batch_0008"),
-    }
+    preview_only = args.box is None and not args.remove_environment_box
+    sources = {"environment": load_source("batch_0004")}
+    if args.box is not None or preview_only:
+        sources["object"] = load_source("batch_0008")
     for name, prepared in sources.items():
         rgb_image(prepared.observations[KEY].rgb).save(root / f"{name}_input.png")
-    if args.box is None:
-        print(f"Inspect {root / 'object_input.png'}; rerun with --box X1 Y1 X2 Y2")
+    if preview_only:
+        print(f"Inspect input previews in {root}; rerun with --box X1 Y1 X2 Y2 to import, "
+              "--remove-environment-box X1 Y1 X2 Y2 to remove, or both")
         return
 
     sam = SAM21Segmenter.from_checkpoint(
@@ -183,10 +206,14 @@ def main():
     )
     labeled = {}
     for name, prepared in sources.items():
-        # The destination image is explicitly treated as the fixed environment.
         if name == "environment":
+            # SAM object masks are subtracted from confirmed environment by the
+            # existing segmentation policy. Only ID 0 is selected for rendering.
             options = dict(
-                prompts={KEY: []},
+                prompts={KEY: [
+                    SegmentPrompts(i, box=torch.tensor(box), name=f"Removed object {i}")
+                    for i, box in enumerate(args.remove_environment_box, start=1)
+                ]},
                 environment_masks={KEY: torch.ones(IMAGE_SIZE, dtype=torch.bool)},
             )
         else:
@@ -194,30 +221,43 @@ def main():
                 SegmentPrompts(1, box=torch.tensor(args.box), name="Selected object"),
             ]})
         segmented = segment_source(prepared, sam, rgb_range=(-1, 1), **options)
+        if name == "environment":
+            returned_ids = {instance.local_id for instance in segmented.observations[KEY].instances}
+            missing = set(range(1, len(args.remove_environment_box) + 1)) - returned_ids
+            if missing:
+                raise ValueError(f"No mask returned for environment removal boxes {sorted(missing)}; choose other boxes")
         labeled[name] = label_source(segmented, source_id=name)
         save_prepared_source(root / f"{name}.npz", prepared)
         save_labeled_source(root / f"{name}_labels", labeled[name])
         overlay = label_overlays(labeled[name], rgb_range=(-1, 1))[KEY]
         Image.fromarray(overlay.permute(1, 2, 0).numpy()).save(root / f"{name}_labels.png")
 
-    object_ids = list(labeled["object"].registry.names)
-    if not object_ids:
-        raise ValueError("No object mask returned; choose another box")
-    object_id = object_ids[0]
-    obs = sources["object"].observations[KEY]
-    ys, xs = torch.where(labeled["object"].labels[KEY] == object_id)
-    if not len(xs):
-        raise ValueError("No valid object pixels; choose another box")
-    z = obs.depth[ys, xs]
-    pixels = torch.stack((xs.float(), ys.float(), torch.ones_like(z)))
-    points = (torch.linalg.inv(obs.intrinsics) @ pixels).T * z[:, None]
     environment = sources["environment"].observations[KEY]
-    u, v = args.target_base
-    if not environment.geometry_mask[v, u]:
-        raise ValueError("Choose a --target-base pixel with valid environment depth")
-    placement, target_z = object_placement(
-        points, ys, environment, args.target_base, args.object_height,
-    )
+    if args.box is not None:
+        object_ids = list(labeled["object"].registry.names)
+        if not object_ids:
+            raise ValueError("No object mask returned; choose another box")
+        object_id = object_ids[0]
+        obs = sources["object"].observations[KEY]
+        ys, xs = torch.where(labeled["object"].labels[KEY] == object_id)
+        if not len(xs):
+            raise ValueError("No valid object pixels; choose another box")
+        z = obs.depth[ys, xs]
+        pixels = torch.stack((xs.float(), ys.float(), torch.ones_like(z)))
+        points = (torch.linalg.inv(obs.intrinsics) @ pixels).T * z[:, None]
+        u, v = args.target_base
+        if not environment.geometry_mask[v, u]:
+            raise ValueError("Choose a --target-base pixel with valid environment depth")
+        placement, target_z = object_placement(
+            points, ys, environment, args.target_base, args.object_height,
+        )
+    else:
+        # Removal-only scenes have no placement anchor. Use input scene depth
+        # to keep trajectory scale independent of any imported object.
+        depths = environment.depth[environment.geometry_mask]
+        if not depths.numel():
+            raise ValueError("Environment has no valid depth for camera travel")
+        target_z = float(depths.median())
 
     poses = torch.eye(4).repeat(1, 24, 1, 1)
     # OpenCV world-to-camera translation is negative as the camera moves forward.
