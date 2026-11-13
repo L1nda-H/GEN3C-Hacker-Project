@@ -117,10 +117,11 @@ class CompositePipelineTests(unittest.TestCase):
         masks = first['rendered_warp_masks']
         self.assertTrue((masks[:, :, 0, :, :, :3] == 1).all())
         self.assertTrue((masks[:, :, 0, :, :, 3:] == 0).all())
-        self.assertTrue((masks[:, :, 1] == 1).all())
-        # The environment remains available behind the foreground buffer.
-        torch.testing.assert_close(first['rendered_warp_images'][0, :, 1],
-                                   torch.tensor([-1., -1., 1.])[None, :, None, None].expand(3, 3, self.h, self.w))
+        self.assertTrue((masks[:, :, 1, :, :, :3] == 0).all())
+        self.assertTrue((masks[:, :, 1, :, :, 3:] == 1).all())
+        # Occluded environment RGB is cleared before encoding.
+        torch.testing.assert_close(first['rendered_warp_images'][0, :, 1, :, :, :3],
+                                   torch.full((3, 3, self.h, 3), -1.))
         self.assertEqual(first['image_path'].shape, (1, 3, 1, self.h, self.w))
         # Selected foreground is red; excluded green object never reaches the seed.
         torch.testing.assert_close(first['image_path'][0, :, 0, :, :3],
@@ -140,6 +141,8 @@ class CompositePipelineTests(unittest.TestCase):
         self.assertEqual(manifest['seed_coverage'], 1)
         self.assertEqual(manifest['conditioning_source_ids'], ['objects', 'room'])
         self.assertEqual(manifest['conditioning_strategy'], 'per_source_latent_concat')
+        self.assertEqual(manifest['conditioning_visibility'], 'joint_nearest_surface')
+        self.assertEqual(manifest['depth_tolerance'], composite.depth_tolerance)
         np.testing.assert_array_equal(np.load(self.review / 'seed.npy'), first['image_path'])
         self.assertTrue((self.review / 'rgb_000000_buffer_001.png').is_file())
         self.assertTrue((self.review / 'seed.png').is_file())
@@ -167,7 +170,8 @@ class CompositePipelineTests(unittest.TestCase):
         self.diffusion.generate = diffuse  # Avoid mocks retaining input tensors.
         with patch('cosmos_predict1.diffusion.inference.gen3c_composite_pipeline.build_composite_scene',
                    return_value=composite), patch.object(composite, 'render_conditioning', render_chunk), \
-                patch.object(composite, 'render_diagnostics', side_effect=AssertionError('Unused diagnostics')):
+                patch.object(composite, 'render_diagnostics', side_effect=AssertionError('Unused diagnostics')), \
+                patch.object(composite, 'render_cache', side_effect=AssertionError('Duplicate projection')):
             self.generate()
         self.assertTrue(all(ref() is None for ref in references.values()))
 
@@ -183,6 +187,10 @@ class CompositePipelineTests(unittest.TestCase):
             self.generate()
         self.assertTrue(all(not call.kwargs['include_depth'] for call in render.call_args_list))
         self.assertFalse(self.review.exists())
+        expected = composite.render_conditioning(*self.scene.cameras(), include_depth=True)
+        actual = self.diffusion.generate.call_args_list[0].kwargs
+        torch.testing.assert_close(actual['rendered_warp_masks'], expected['coverage'][:, :3])
+        torch.testing.assert_close(actual['rendered_warp_images'], expected['rgb'][:, :3])
 
     def test_writer_uses_validated_provenance_without_reparsing_labels(self):
         composite = build_composite_scene(self.scene)
@@ -459,7 +467,7 @@ class CompositePipelineTests(unittest.TestCase):
         torch.testing.assert_close(encoded[:, 3:6], torch.full_like(encoded[:, 3:6], 3))
         torch.testing.assert_close(encoded[:, 6:], torch.zeros_like(encoded[:, 6:]))
 
-        # Exercise the actual multi-buffer encoder with independently rendered caches.
+        # Exercise the actual multi-buffer encoder with globally visible source buffers.
         buffers = build_composite_scene(self.scene).render_conditioning(*self.scene.cameras())
         fake.encode.reset_mock()
         encoded = module.DiffusionGen3CModel.encode_warped_frames(

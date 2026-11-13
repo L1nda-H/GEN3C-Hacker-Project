@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from cosmos_predict1.diffusion.inference.cache3d_composite import combine_visible_buffers
 from cosmos_predict1.diffusion.inference.composite_scene import SceneSpec, build_composite_scene
 from cosmos_predict1.diffusion.inference.composite_review import save_manifest, save_render, save_seed, source_manifest
 
@@ -78,6 +79,8 @@ class Gen3cCompositePipeline:
                         generated_cache_updates=False, seed_hole_fill=-1,
                         conditioning_source_ids=buffer_source_ids,
                         conditioning_strategy='per_source_latent_concat',
+                        conditioning_visibility='joint_nearest_surface',
+                        depth_tolerance=composite.depth_tolerance,
                         min_seed_coverage=min_seed_coverage)
 
         def record(**changes):
@@ -100,9 +103,8 @@ class Gen3cCompositePipeline:
                     save_render(review_dir, start, rendered)
                 del rendered  # Release review depth before diffusion.
                 if start == 0:
-                    # The image-conditioning input still needs one composed image.
-                    # Joint visibility is used only for this seed, never for buffers.
-                    seed_rgb, seed_mask = composite.render_cache(poses[:, :1], intrinsics[:, :1])
+                    # Visible source buffers already contain the joint winners.
+                    seed_rgb, seed_mask = combine_visible_buffers(rgb[:, :1], coverage[:, :1])
                     seed = seed_rgb[:, 0, 0].unsqueeze(2).clone()
                     record(seed_coverage=float(seed_mask.mean()))
                     if is_writer:

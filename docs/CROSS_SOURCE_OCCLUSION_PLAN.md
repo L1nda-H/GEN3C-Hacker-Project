@@ -1,24 +1,38 @@
 # Cross-source occlusion for separate conditioning buffers
 
-Status: planned. Keep one conditioning buffer per selected source, but retain
+Status: implemented. Keep one conditioning buffer per selected source, but retain
 only surfaces visible across the whole composite. Environment ID 0 participates
 in depth testing normally. Existing back-projection and placement already put
-geometry in destination coordinates; no additional depth estimator is needed.
+geometry in destination coordinates; placement must also establish a consistent
+destination scale and position for unrelated scenes. No additional depth
+estimator is needed.
+
+Keep both public methods: `render_cache()` returns one combined scene buffer;
+`render_conditioning()` returns separate source buffers required by diffusion.
+Both depth-test a joint table of selected, transformed points. Concatenating
+this table preserves source/object ownership; it does not fuse geometry or
+modify child caches. Objects from the same source share a conditioning buffer.
 
 ## Function changes
 
 1. **`Cache3D_Composite._render_frames()` — route joint winners to source buffers.**
-   Add an internal mode that uses the joint sample table and existing
-   `_resolve_visibility()` once per frame chunk, then writes each winning point
-   into its owning source's buffer. Obtain ownership from sample metadata and
-   explicitly map its index in `sorted(self.sources)` to the buffer index in
-   `conditioning_source_ids`; these lists can differ. Preserve bounded winner
-   gathers and frame/point chunking. This shares the joint renderer's exact
-   nearest-depth and deterministic source/object/pixel tie rules, including
-   tolerance cases, rather than approximating them with independent depth maps.
+   Use one shared rendering path over the joint sample table, calling existing
+   `_resolve_visibility()` once per frame chunk. A source-to-output-slot mapping
+   determines where each winning point is written: all sources map to slot 0
+   for joint seed/diagnostic renders; conditioning maps each selected source to
+   its slot in `conditioning_source_ids`. Obtain ownership from sample metadata
+   without allocating full diagnostic outputs, and explicitly translate its index in `sorted(self.sources)`; registered and
+   selected source lists can differ. Reuse the same bounded winner gathers,
+   depth calculation, and output writes for both output layouts. Preserve
+   frame/point chunking and the exact nearest-depth and deterministic
+   source/object/pixel tie rules, including tolerance cases. Retain the
+   per-source `_sample_tables` and cached `_joint_table`; remove the per-source
+   `table=` override once the independent conditioning loop is removed.
 
-2. **`Cache3D_Composite.render_conditioning()` — use joint visibility by default.**
-   Replace the independent per-source render loop with the source-routing mode.
+2. **`Cache3D_Composite.render_conditioning()` — use the shared joint renderer.**
+   Replace the independent per-source render loop with one call to the shared
+   renderer, supplying the source-to-output-slot mapping. No separate rendering
+   mode or independent-visibility fallback is needed.
    Keep RGB `[1,T,N,3,H,W]`, coverage `[1,T,N,1,H,W]`, and optional camera-Z depth
    `[1,T,N,H,W]`. Nonwinning pixels use RGB -1, coverage 0, and depth 0. Keep
    stable slots for fully occluded or empty selected sources; omit unselected
@@ -30,13 +44,19 @@ geometry in destination coordinates; no additional depth estimator is needed.
    Record cross-source visibility alongside the existing latent-concatenation
    strategy and depth tolerance. Keep `include_depth=is_writer`: only the file
    writer needs returned review depth, while every process resolves visibility.
-   Update the seed comment: the seed and separate buffers now share joint
-   visibility. Preserve buffer capacity checks and release review tensors before
+   Derive the initial seed and its coverage from the first conditioning frame,
+   removing the repeated `render_cache()` projection. Use one small shared
+   recombination helper: sum RGB only where coverage is 1, union coverage, and
+   fill uncovered RGB with -1. Never sum raw RGB containing -1 hole values.
+   Preserve buffer capacity checks and release review tensors before
    diffusion. No diffusion API or encoder changes are required.
 
 4. **`scripts/evaluate_real_cache_mvp.export_previews()` — describe visible buffers.**
    Record the visibility policy in preview metadata. Existing per-source panels
    should now show occlusion holes; retain the joint reference for comparison.
+   Build that image with the same recombination helper instead of rendering
+   each frame again with `render_cache()`. Keep the standalone joint renderer
+   as an independent test oracle.
    `composite_review.save_render()` can keep its current output schema.
 
 ## Verification
@@ -48,6 +68,7 @@ geometry in destination coordinates; no additional depth estimator is needed.
 - At every covered pixel, exactly one source buffer must win. Combining visible
   buffers must reproduce joint RGB, depth, and coverage, across camera motion
   and frame/point chunk sizes; holes must never occlude valid surfaces.
+  Verify recombined seeds/previews match `render_cache()`, including RGB -1 holes.
 - Update `tests/test_composite_pipeline.py` to verify masked buffers reach
   diffusion, writer/nonwriter visibility agrees, and tensor lifetime checks
   still pass. Nonwriters continue to omit returned review depth and files.

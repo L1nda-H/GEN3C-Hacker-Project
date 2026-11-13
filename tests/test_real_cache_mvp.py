@@ -2,6 +2,7 @@
 
 from contextlib import redirect_stderr, redirect_stdout
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
+from PIL import Image
 
 from scripts import evaluate_real_cache_mvp as mvp
 from cosmos_predict1.diffusion.inference.instance_segmentation import (
@@ -84,6 +86,26 @@ class RealCacheMVPTests(unittest.TestCase):
                     environment_coverage = rendered['coverage'][0, 0, 0, 0]
                     self.assertEqual(bool(environment_coverage[1:3, 1:3].all()), not remove)
                     self.assertTrue(rendered['coverage'][0, 0, 1].any())
+
+    def test_preview_recombination_matches_joint_without_duplicate_projection(self):
+        scene = self.run_scene('--box', '1', '1', '3', '4',
+                               '--remove-environment-box', '1', '1', '3', '3',
+                               '--target-base', '6', '5', '--object-height', '3')
+        cache = mvp.build_composite_scene(scene, device='cpu')
+        poses, intrinsics = scene.cameras()
+        root = self.root / 'recombined'
+        with patch.object(cache, 'render_cache', side_effect=AssertionError('Duplicate projection')), \
+                redirect_stdout(io.StringIO()):
+            mvp.export_previews(cache, poses, intrinsics, root)
+        for frame in range(poses.shape[1]):
+            rgb, _ = cache.render_cache(poses[:, frame:frame + 1], intrinsics[:, frame:frame + 1])
+            np.testing.assert_array_equal(np.asarray(Image.open(root / f'joint_reference_{frame:06d}.png')),
+                                          np.asarray(mvp.rgb_image(rgb[0, 0, 0])))
+            if frame == 0:
+                np.testing.assert_array_equal(np.load(root / 'seed.npy'), rgb[:, 0, 0].unsqueeze(2))
+        metadata = json.loads((root / 'preview.json').read_text())
+        self.assertEqual(metadata['conditioning_visibility'], 'joint_nearest_surface')
+        self.assertEqual(metadata['depth_tolerance'], cache.depth_tolerance)
 
     def test_no_arguments_still_exports_inputs_without_sam(self):
         with redirect_stdout(io.StringIO()):

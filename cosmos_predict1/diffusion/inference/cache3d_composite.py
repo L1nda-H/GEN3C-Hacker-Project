@@ -1,9 +1,9 @@
 """Selection, placement, and rendering for static labeled image caches.
 
 The environment defines destination world coordinates. Cameras consuming these
-samples use OpenCV world-to-camera conventions. Conditioning renders sources
-independently; seed/diagnostic rendering uses joint visibility. Both use the same
-nearest-surface rasterizer; no child cache tensors are changed by this wrapper.
+samples use OpenCV world-to-camera conventions. Conditioning and joint renders
+share global nearest-surface visibility, routing winners into separate source
+buffers or one scene buffer. No child cache tensors are changed by this wrapper.
 """
 
 from dataclasses import dataclass
@@ -14,6 +14,17 @@ import torch
 from cosmos_predict1.diffusion.inference.cache_3d import Cache3D_Base
 from cosmos_predict1.diffusion.inference.camera_validation import validate_opencv_cameras
 from cosmos_predict1.diffusion.inference.forward_warp_utils_pytorch import nearest_surface_winners
+
+
+def combine_visible_buffers(rgb, coverage):
+    """Recombine disjoint visible source buffers, retaining -1 RGB in holes.
+
+    Inputs use [B,T,N,C,H,W]; outputs retain a singleton source dimension.
+    """
+    visible = coverage.bool()
+    combined_coverage = visible.any(dim=2, keepdim=True)
+    combined_rgb = torch.where(visible, rgb, 0.).sum(dim=2, keepdim=True)
+    return combined_rgb.masked_fill(~combined_coverage, -1.), combined_coverage.to(coverage.dtype)
 
 
 @dataclass(frozen=True)
@@ -363,8 +374,11 @@ class Cache3D_Composite:
                 )
         return self._joint_table
 
-    def _render_frames(self, poses, intrinsics, *, rgb, depth, diagnostics, table=None):
-        table = self._joint_render_table(rgb=rgb, diagnostics=diagnostics) if table is None else table
+    def _render_frames(self, poses, intrinsics, *, rgb, depth, diagnostics, source_slots=None):
+        # Ownership needs sample metadata, but never full diagnostic outputs.
+        table = self._joint_render_table(rgb=rgb, diagnostics=diagnostics or source_slots is not None)
+        slots = 1 if source_slots is None else max(source_slots) + 1
+        slot_map = None if source_slots is None else torch.tensor(source_slots, dtype=torch.int64)
         points, colors, metadata = table.points, table.colors, table.metadata
         if diagnostics:
             source_ids = tuple(sorted(self.sources))
@@ -373,8 +387,8 @@ class Cache3D_Composite:
         pixels = height * width
         device = poses.device
         # Flat storage lets bounded winner batches write directly into outputs.
-        coverage = torch.zeros(frames * pixels, device=device, dtype=torch.float32)
-        image = torch.full((frames * pixels, 3), -1., device=device, dtype=torch.float32) if rgb else None
+        coverage = torch.zeros(frames * slots * pixels, device=device, dtype=torch.float32)
+        image = torch.full((frames * slots * pixels, 3), -1., device=device, dtype=torch.float32) if rgb else None
         z_buffer = torch.zeros_like(coverage) if depth else None
         if diagnostics:
             winners = torch.full((frames * pixels, 3), -1, dtype=torch.int64, device=device)
@@ -393,23 +407,24 @@ class Cache3D_Composite:
                 if not covered.numel():
                     continue
                 rank = batch[covered].cpu()
-                destination = start * pixels + offset + covered
+                frame = (offset + covered) // pixels + start
+                slot = 0 if slot_map is None else slot_map[metadata[rank, 0]].to(device)
+                destination = (frame * slots + slot) * pixels + (offset + covered) % pixels
                 coverage[destination] = 1
                 if rgb:
                     image[destination] = colors[rank].to(device)
                 if depth:
-                    frame = (offset + covered) // pixels + start
                     chosen = points[rank].to(device)
                     # Preserve the selected point's actual camera-Z, including
                     # when categorical priority chooses a near-equal surface.
                     z_buffer[destination] = (chosen * poses[frame, 2, :3]).sum(-1) + poses[frame, 2, 3]
                 if diagnostics:
                     winners[destination] = metadata[rank].to(device)
-        result = dict(coverage=coverage.reshape(1, frames, 1, 1, height, width))
+        result = dict(coverage=coverage.reshape(1, frames, slots, 1, height, width))
         if rgb:
-            result['rgb'] = image.reshape(frames, height, width, 3).permute(0, 3, 1, 2)[None, :, None]
+            result['rgb'] = image.reshape(frames, slots, height, width, 3).permute(0, 1, 4, 2, 3)[None]
         if depth:
-            result['depth'] = z_buffer.reshape(1, frames, 1, height, width)
+            result['depth'] = z_buffer.reshape(1, frames, slots, height, width)
         if diagnostics:
             result.update(source_ids=source_ids, winners=winners.reshape(1, frames, height, width, 3),
                           nearest_depth=nearest_depth.reshape(1, frames, 1, height, width))
@@ -439,30 +454,19 @@ class Cache3D_Composite:
 
     @torch.no_grad()
     def render_conditioning(self, target_w2cs, target_intrinsics, start_frame_idx=0, *, include_depth=False):
-        """Render one independent buffer per selected source, in source-ID order.
+        """Render globally visible surfaces into stable source-ID ordered slots.
 
-        RGB is [1,T,N,3,H,W], coverage [1,T,N,1,H,W], and optional depth
-        [1,T,N,H,W]. Occlusion is resolved within each source only. Empty
-        geometry retains its buffer slot; sources with no selection are omitted.
-        render_cache/render_diagnostics retain joint visibility for seeds/review.
+        RGB is [1,T,N,3,H,W], coverage [1,T,N,1,H,W], and optional camera-Z
+        depth [1,T,N,H,W]. Empty or fully hidden geometry retains its slot;
+        sources with no selection are omitted. Hole values are -1/0/0.
         """
         poses, intrinsics = self._target_cameras(target_w2cs, target_intrinsics, start_frame_idx)
-        result = {}
+        source_ids = self.conditioning_source_ids
+        selected_slots = {name: i for i, name in enumerate(source_ids)}
+        source_slots = tuple(selected_slots.get(name, -1) for name in sorted(self.sources))
         with torch.autocast(device_type=poses.device.type, enabled=False):
-            source_ids = self._render_tables(rgb=True, diagnostics=False)
-            for index, source_id in enumerate(source_ids):
-                rendered = self._render_frames(
-                    poses, intrinsics, rgb=True, depth=include_depth, diagnostics=False,
-                    table=self._sample_tables[source_id],
-                )
-                for name, value in rendered.items():
-                    if name not in result:
-                        shape = list(value.shape)
-                        shape[2] = len(source_ids)
-                        result[name] = value.new_empty(shape)
-                    result[name][:, :, index:index + 1] = value
-                del rendered, value
-        return result
+            return self._render_frames(poses, intrinsics, rgb=True, depth=include_depth,
+                                       diagnostics=False, source_slots=source_slots)
 
     @property
     def conditioning_source_ids(self):

@@ -7,7 +7,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from cosmos_predict1.diffusion.inference.cache_3d import Cache3D_Base
-from cosmos_predict1.diffusion.inference.cache3d_composite import Cache3D_Composite
+from cosmos_predict1.diffusion.inference.cache3d_composite import Cache3D_Composite, combine_visible_buffers
 from cosmos_predict1.diffusion.inference.instance_labeling import ObjectRegistry
 
 
@@ -43,7 +43,7 @@ def composite(environment, *objects, **options):
 
 
 class RenderingTests(unittest.TestCase):
-    def test_conditioning_resolves_occlusion_only_within_each_source(self):
+    def test_conditioning_resolves_occlusion_across_sources(self):
         env = source('room', [[0, 0, 4]], colors=[[-1, -1, 1]])
         objects = source('props', [[0, 0, 2], [0, 0, 1], [0, 0, .5]], ids=[1, 2, 3],
                          colors=[[1, -1, -1], [-1, 1, -1], [1, 1, 1]])
@@ -52,9 +52,9 @@ class RenderingTests(unittest.TestCase):
         baseline = scene.render_conditioning(*cameras(3), include_depth=True)
         self.assertEqual(scene.conditioning_source_ids, ('props', 'room'))
         self.assertEqual(baseline['rgb'].shape, (1, 3, 2, 3, 3, 4))
-        torch.testing.assert_close(baseline['depth'][0, :, :, 0, 0], torch.tensor([[1., 4.]] * 3))
+        torch.testing.assert_close(baseline['depth'][0, :, :, 0, 0], torch.tensor([[1., 0.]] * 3))
         torch.testing.assert_close(baseline['rgb'][0, 0, :, :, 0, 0],
-                                   torch.tensor([[-1., 1, -1], [-1, -1, 1]]))
+                                   torch.tensor([[-1., 1, -1], [-1, -1, -1]]))
         for frame_chunk, point_chunk in [(1, 1), (5, 100)]:
             scene.frame_chunk_size, scene.point_chunk_size = frame_chunk, point_chunk
             rendered = scene.render_conditioning(*cameras(3), include_depth=True)
@@ -68,7 +68,70 @@ class RenderingTests(unittest.TestCase):
         moved = scene.render_conditioning(*cameras(), include_depth=True)
         self.assertEqual(moved['depth'][0, 0, 0, 0, 0], 2)
         self.assertEqual(moved['depth'][0, 0, 0, 0, 1], 1)
-        self.assertEqual(moved['depth'][0, 0, 1, 0, 0], 4)
+        self.assertEqual(moved['depth'][0, 0, 1, 0, 0], 0)
+
+    def assert_conditioning_matches_joint(self, scene, target):
+        with patch.object(scene, '_resolve_visibility', wraps=scene._resolve_visibility) as resolve:
+            buffers = scene.render_conditioning(*target, include_depth=True)
+        self.assertEqual(resolve.call_count, (target[0].shape[1] + scene.frame_chunk_size - 1)
+                         // scene.frame_chunk_size)
+        self.assertTrue((buffers['coverage'].sum(dim=2) <= 1).all())
+        rgb, coverage = combine_visible_buffers(buffers['rgb'], buffers['coverage'])
+        joint = scene.render_diagnostics(*target, include_rgb=True)
+        torch.testing.assert_close(rgb, joint['rgb'], rtol=0, atol=0)
+        torch.testing.assert_close(coverage, joint['coverage'], rtol=0, atol=0)
+        torch.testing.assert_close(buffers['depth'].sum(dim=2, keepdim=True), joint['depth'], rtol=0, atol=0)
+        holes = ~buffers['coverage'].bool()
+        self.assertTrue((buffers['rgb'][holes.expand_as(buffers['rgb'])] == -1).all())
+        self.assertTrue((buffers['depth'][holes.squeeze(3)] == 0).all())
+        without_depth = scene.render_conditioning(*target)
+        self.assertEqual(set(without_depth), {'rgb', 'coverage'})
+        for key in without_depth:
+            torch.testing.assert_close(without_depth[key], buffers[key], rtol=0, atol=0)
+        return buffers
+
+    def test_conditioning_joint_parity_ownership_ties_motion_and_cache_changes(self):
+        # Unselected sources change registered indices; empty sources retain slots.
+        scene = composite(source('room', [[0, 0, 1], [2, 0, 2], [4, 0, 2]]),
+                          source('b', [[0, 0, 1.09], [1, 0, 1]], ids=[1, 2]),
+                          source('c', [[0, 0, 1], [0, 0, float('nan')]], ids=[1, 1]),
+                          source('empty', [[0, 0, .5]], ids=[1], mask=[False]),
+                          depth_tolerance=.1)
+        scene.add_source('a-unselected', source('a-unselected', [[0, 0, .1]], ids=[1]))
+        target = cameras(5)
+        target[0][0, 1, 0, 3] = 1
+        target[0][0, 2, 2, 3] = 1
+        for frame_chunk, point_chunk in [(1, 1), (3, 2), (20, 100)]:
+            scene.frame_chunk_size, scene.point_chunk_size = frame_chunk, point_chunk
+            buffers = self.assert_conditioning_matches_joint(scene, target)
+            self.assertAlmostEqual(buffers['depth'][0, 0, 0, 0, 0].item(), 1.09, places=6)
+            self.assertFalse(buffers['coverage'][:, :, 1:3].any())
+        scene.set_selection('b', [2])
+        self.assert_conditioning_matches_joint(scene, target)
+        move = torch.eye(4)
+        move[2, 3] = 2
+        scene.set_transform('c', move)
+        self.assert_conditioning_matches_joint(scene, target)
+        scene.depth_tolerance = 0
+        self.assert_conditioning_matches_joint(scene, target)
+
+    def test_conditioning_environment_front_exact_ties_and_invalid_samples(self):
+        scene = composite(source('room', [[0, 0, 1], [1, 0, 1], [2, 0, 1]]),
+                          source('a-props', [[0, 0, 2], [1, 0, 1], [2, 0, 1],
+                                            [0, 0, -1], [0, 0, 0], [float('inf'), 0, 1]],
+                                 ids=[1, 2, 1, 1, 1, 1],
+                                 colors=[[1, -1, -1]] * 6), depth_tolerance=0)
+        result = self.assert_conditioning_matches_joint(scene, cameras())
+        torch.testing.assert_close(result['coverage'][0, 0, :, 0, 0, :3],
+                                   torch.tensor([[0., 1, 1], [1., 0, 0]]))
+        # The source-local canonical ID wins exact ties before original pixels.
+        scene = composite(source('room', [[0, 0, 1]], ids=[-1]),
+                          source('a-props', [[0, 0, 1]] * 3, ids=[2, 1, 1],
+                                 colors=[[1, -1, -1], [-1, 1, -1], [-1, -1, 1]]))
+        result = self.assert_conditioning_matches_joint(scene, cameras())
+        torch.testing.assert_close(result['rgb'][0, 0, 0, :, 0, 0], torch.tensor([-1., 1, -1]))
+        scene.set_selection('a-props', [])
+        self.assert_conditioning_matches_joint(scene, cameras())
 
     def test_conditioning_slots_survive_empty_geometry_but_omit_unselected_sources(self):
         scene = composite(source('room', [[0, 0, 4]]),
@@ -335,6 +398,11 @@ class RenderingTests(unittest.TestCase):
             details = scene.render_diagnostics(*target)
         self.assertNotIn((torch.ops.aten.full.default, (18, 3), torch.float32), allocations)
         torch.testing.assert_close(details['depth'], depth, rtol=0, atol=0)
+        allocations.clear()
+        with MemoryOperations():
+            scene.render_conditioning(*target)
+        self.assertFalse(any(dtype == torch.int64 and shape == (18, 3)
+                             for _, shape, dtype in allocations))
         self.assertTrue(gathers)
         self.assertLessEqual(max(gathers), scene.point_chunk_size)
 

@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw
 
+from cosmos_predict1.diffusion.inference.cache3d_composite import combine_visible_buffers
 from cosmos_predict1.diffusion.inference.composite_review import save_render, save_seed
 from cosmos_predict1.diffusion.inference.composite_scene import (
     SceneSource,
@@ -117,7 +118,7 @@ def export_previews(cache, poses, intrinsics, root):
         )
         save_render(root, i, rendered)
         # This joint image is not sent as a conditioning buffer to diffusion.
-        joint, _ = cache.render_cache(poses[:, i:i + 1], intrinsics[:, i:i + 1], start_frame_idx=i)
+        joint, _ = combine_visible_buffers(rendered["rgb"], rendered["coverage"])
         joint_image = rgb_image(joint[0, 0, 0])
         joint_image.save(root / f"joint_reference_{i:06d}.png")
         if i == 0:
@@ -138,6 +139,7 @@ def export_previews(cache, poses, intrinsics, root):
         images[0].save(root / f"buffer_{index:03d}.gif", save_all=True,
                        append_images=images[1:], duration=100, loop=0)
     metadata = dict(conditioning_source_ids=source_ids, conditioning_strategy="per_source_latent_concat",
+                    conditioning_visibility="joint_nearest_surface", depth_tolerance=cache.depth_tolerance,
                     num_frames=len(frames), image_size=cache.image_size,
                     joint_reference="Geometric preview only; frame 0 supplies the image-conditioning seed")
     (root / "preview.json").write_text(json.dumps(metadata, indent=2) + "\n")

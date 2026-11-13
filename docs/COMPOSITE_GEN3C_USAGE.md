@@ -107,12 +107,15 @@ seed and previews, then raises an error so the scene author can choose a better
 starting camera; camera order is never changed automatically. Seed holes use
 the renderer's black fill (-1). The seed latent path has no coverage mask, so
 inspect hole artifacts during real inference. Warp conditioning does carry
-binary coverage. Each selected source cache is rendered independently into one
-buffer; selected objects from the same source share that buffer. Buffers are
-ordered by sorted source ID, recorded as `conditioning_source_ids` in the
-manifest. Cross-source occlusion is left to diffusion; background remains
-available in its own buffer behind foreground objects. Sources with no selection
-are omitted; selected sources with empty geometry retain an empty buffer slot.
+binary coverage. All selected sources share one joint depth test, with each
+winning surface routed into its source buffer. Selected objects from the same
+source share that buffer. Buffers are ordered by sorted source ID, recorded as
+`conditioning_source_ids` in the
+manifest. Closer geometry occludes farther geometry across sources, including
+the environment. Hidden RGB, depth, and coverage are cleared to -1/0/0. Sources
+with no selection are omitted; empty or fully hidden selected sources retain slots.
+Source placement must establish consistent destination positions and scale;
+back-projection alone does not align unrelated scenes.
 
 The existing model independently encodes each RGB and mask buffer, concatenates
 those latents along channels, and pads unused slots with zero latents. The
@@ -122,11 +125,11 @@ silently discarding sources or changing model capacity. Model weights and APIs
 are unchanged. This is the current code's latent concatenation strategy, not
 the paper's feature max pooling.
 
-Only the initial image-conditioning seed uses joint depth rendering of all
-selected sources. `render_cache()` and `render_diagnostics()` retain that joint
-rendering behavior for seeds and geometric previews; `render_conditioning()`
-produces the separate source buffers. Separate rendering preserves missing
-coverage in each source mask; it does not itself fill gaps between points.
+`render_cache()` and `render_diagnostics()` return combined scene renders;
+`render_conditioning()` routes the same joint winners into separate source
+buffers. The initial seed and preview joint images are recombined from visible
+buffers without another projection. Recombination sums covered RGB only and
+fills uncovered pixels with -1. Rendering does not fill gaps between points.
 
 Chunks overlap by one frame. Each continuation uses the preceding generated
 frame as its seed. Source caches remain static and generated-frame cache
@@ -140,7 +143,8 @@ The CLI saves `<name>.mp4` and `<name>_review/` containing:
 - `scene.json`: resolved scene configuration and placement matrices.
 - `generation.json`: source fingerprints, label revisions/provenance and hashes,
   resolved selections/transforms, generation settings, code/checkpoint revision,
-  seed coverage, ordered conditioning source IDs, strategy and completion/blocked/failure status.
+  seed coverage, ordered conditioning source IDs, strategy, visibility policy,
+  depth tolerance, and completion/blocked/failure status.
 - `seed.npy` and `seed.png`: exact normalized seed `[1,3,1,H,W]` and preview.
 - `render_<start>.npz`: complete per-chunk RGB `[1,T,N,3,H,W]` in [-1,1],
   metric camera-Z depth `[1,T,N,H,W]` and coverage `[1,T,N,1,H,W]` in {0,1}.
@@ -151,12 +155,13 @@ The CLI saves `<name>.mp4` and `<name>_review/` containing:
 - `prompt.txt`: final prompt on successful CLI generation.
 
 CPU contract tests use mocked diffusion. The MVP still requires manual CUDA
-validation on GCP: inspect placement scale, model resolution of cross-source occlusion, excluded
+validation on GCP: inspect placement scale, generated occlusion boundaries, excluded
 object leakage, seed holes, recognizability, and temporal consistency. Record
 visual failures separately from errors already visible in geometric renders.
 
-Generation renders RGB/coverage plus review depth on the writer rank only; it
-does not allocate categorical winner or nearest-depth diagnostics. Review depth
-is released before diffusion, and conditioning buffers before the next chunk.
+Every rank renders RGB/coverage with joint visibility; only the writer returns
+review depth. Rendering does not allocate categorical winner or nearest-depth
+diagnostics. Review depth is released before diffusion, and conditioning buffers
+before the next chunk.
 Other ranks omit review-only buffers, hashes, and files. Source provenance comes
 from the already validated label records. Preview tools retain full diagnostics.

@@ -142,25 +142,27 @@ fresh directory for each mode to avoid leftover artifacts from earlier runs:
 - `render_<frame>.npz`: exact RGB `[1,1,N,3,H,W]`, depth `[1,1,N,H,W]`, and
   coverage `[1,1,N,1,H,W]` buffers. Here `N=1` for removal only, or `N=2` with
   an import; `H=240`, `W=320`.
-- `joint_reference_<frame>.png`: joint depth-rendered reference, not a fused
-  conditioning buffer or a diffusion prediction.
-- `seed.npy`, `seed.png`: joint-rendered initial image-conditioning seed,
-  with exact normalized array shape `[1,3,1,H,W]`.
-- `preview.json`: ordered source IDs, conditioning strategy, frame count,
-  and image dimensions.
+- `joint_reference_<frame>.png`: joint reference recombined from visible source
+  buffers, not a fused conditioning buffer or a diffusion prediction.
+- `seed.npy`, `seed.png`: initial image-conditioning seed recombined from visible
+  buffers, with exact normalized array shape `[1,3,1,H,W]`.
+- `preview.json`: ordered source IDs, conditioning strategy, visibility policy,
+  depth tolerance, frame count, and image dimensions.
 - `scene.json`: saved composition and camera trajectory.
 - `environment.npz`, optional `object.npz`, and `*_labels.npz/json`: reusable source artifacts.
 
 For the MVP, check the object's silhouette, recognizability, placement, and
-stability in its own buffer. Inspect cross-source occlusion in the joint
-reference. The environment intentionally remains visible behind objects in its
-own buffer; no cross-source depth test is applied to conditioning buffers.
+stability in its own buffer. All selected sources share a joint depth test;
+only each pixel's winning source retains RGB, depth, and coverage. Inspect
+occlusion holes in individual buffers and the recombined joint reference.
+Placement transforms must establish consistent destination scale and position
+for sources from unrelated scenes.
 During actual generation, each RGB/mask buffer is encoded independently and
 the latents are concatenated for diffusion. This CPU preview does not execute
-that model or predict its resolution of occlusion.
+that model or predict generated-video quality.
 
 Coverage images show each source's holes, including gaps that a background
-buffer could otherwise hide. Separate rendering does not itself fill these
+buffer could otherwise hide. Joint visibility does not itself fill these
 gaps. Depth PNGs normalize independently per frame and buffer; use NPZ buffers
 for numeric depth comparisons. RGB uses [-1,1], holes use RGB -1/depth 0, and
 coverage is binary.
