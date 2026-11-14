@@ -237,7 +237,8 @@ class CompositePipelineTests(unittest.TestCase):
             parser = create_parser()
         args = parser.parse_args(['--scene_spec', 'unused', '--prompt', 'red object',
                                   '--height', str(self.h), '--width', str(self.w)])
-        for name in ('prompt_upsampler_dir', 'disable_prompt_upsampler', 'offload_prompt_upsampler', 'tokenizer_dir'):
+        for name in ('prompt_upsampler_dir', 'disable_prompt_upsampler', 'offload_prompt_upsampler', 'tokenizer_dir',
+                     'rasterization', 'candidate_batch_size', 'support_depth_tolerance'):
             self.assertFalse(hasattr(args, name))
             self.assertNotIn('--' + name, parser.format_help())
         args.scene_spec = None
@@ -311,6 +312,19 @@ class CompositePipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'size'):
             self.generate()
         self.diffusion.generate.assert_not_called()
+
+    def test_adaptive_renderer_defaults_reach_conditioning_and_review_metadata(self):
+        self.generate()
+        first = self.diffusion.generate.call_args_list[0].kwargs
+        self.assertEqual(first['rendered_warp_images'].shape[2], 2)
+        from cosmos_predict1.diffusion.inference.cache3d_composite import combine_visible_buffers
+        rgb, coverage = combine_visible_buffers(first['rendered_warp_images'][:, :1],
+                                                first['rendered_warp_masks'][:, :1])
+        torch.testing.assert_close(first['image_path'], rgb[:, 0, 0].unsqueeze(2))
+        self.assertTrue((coverage == 1).all())
+        manifest = json.loads((self.review / 'generation.json').read_text())
+        self.assertEqual(manifest['renderer']['candidate_batch_size'], 262144)
+        self.assertEqual(manifest['renderer']['support_depth_tolerance'], .05)
 
     def test_buffer_capacity_rejected_before_rendering_or_diffusion(self):
         self.diffusion.model.frame_buffer_max = 1

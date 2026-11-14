@@ -40,8 +40,11 @@ class CompositeTests(unittest.TestCase):
         self.environment = child('room')
         self.object = child('objects')
         self.composite = Cache3D_Composite()
-        self.composite.add_source('room', self.environment, is_environment=True)
-        self.composite.add_source('objects', self.object)
+        self.add_source('room', self.environment, is_environment=True)
+        self.add_source('objects', self.object)
+
+    def add_source(self, *args, **kwargs):
+        return self.composite.add_source(*args, source_w2c=torch.eye(4), source_intrinsics=torch.eye(3), **kwargs)
 
     def samples(self):
         return {(s.source_id, s.instance_id): s for s in self.composite._iter_render_inputs()}
@@ -71,26 +74,26 @@ class CompositeTests(unittest.TestCase):
 
     def test_registration_and_static_layout_validation(self):
         with self.assertRaisesRegex(ValueError, 'unique'):
-            self.composite.add_source('room', self.environment)
+            self.add_source('room', self.environment)
         with self.assertRaisesRegex(ValueError, 'Exactly one'):
-            self.composite.add_source('second', child('second'), is_environment=True)
+            self.add_source('second', child('second'), is_environment=True)
         with self.assertRaisesRegex(ValueError, 'ownership'):
-            self.composite.add_source('wrong', self.object)
+            self.add_source('wrong', self.object)
         for axis in ['B', 'F', 'N', 'V']:
             # B needs its own layout because child() already supplies B.
             cache = child('multi', count=2, axis=axis if axis != 'B' else 'N')
             if axis == 'B':
                 cache.input_image = cache.input_image[:, :, :1].expand(2, 1, 1, 1, 3, 2, 3)
             with self.subTest(axis=axis), self.assertRaisesRegex(ValueError, 'B=F=N=V=1'):
-                self.composite.add_source('multi', cache)
+                self.add_source('multi', cache)
         with self.assertRaises(ValueError):
-            self.composite.add_source('unlabeled', child('unlabeled', labels=False))
+            self.add_source('unlabeled', child('unlabeled', labels=False))
         cache = child('bad')
         cache.input_image.fill_(2)
         with self.assertRaisesRegex(ValueError, 'RGB'):
-            self.composite.add_source('bad', cache)
+            self.add_source('bad', cache)
         no_environment = Cache3D_Composite()
-        no_environment.add_source('objects', self.object)
+        no_environment.add_source('objects', self.object, source_w2c=torch.eye(4), source_intrinsics=torch.eye(3))
         with self.assertRaisesRegex(ValueError, 'environment'):
             list(no_environment._iter_render_inputs())
         self.assertNotIn('bad', self.composite.sources)
@@ -186,7 +189,7 @@ class CompositeTests(unittest.TestCase):
         buffer = child('buffer', cache_type=Cache3D_Buffer)
         buffer.source_fingerprint = 'original'
         buffer._label_binding = ('buffer', 'original', None)
-        self.composite.add_source('buffer', buffer)
+        self.add_source('buffer', buffer)
         buffer.update_cache(torch.ones(1, 3, 2, 3), torch.ones(1, 1, 2, 3),
                             torch.eye(4)[None], new_intrinsics=torch.eye(3)[None], depth_alignment=False,
                             new_labels=torch.ones(1, 1, 2, 3, dtype=torch.int64))
@@ -208,7 +211,7 @@ class CompositeTests(unittest.TestCase):
 
         initial = labeled(torch.tensor([[True, False, False], [False, False, False]]))
         cache = Cache3D_Base(**initial.cache_kwargs(), device='cpu')
-        self.composite.add_source('corrected', cache)
+        self.add_source('corrected', cache)
         self.composite.set_selection('corrected', [1])
         self.composite.set_transform('corrected', translation(4), instance_id=1)
         updated = labeled(torch.tensor([[False, False, False], [False, False, True]]), initial.registry)
@@ -224,7 +227,7 @@ class CompositeTests(unittest.TestCase):
         buffer = child('buffer', cache_type=Cache3D_Buffer)
         self.assertIsNone(buffer.source_fingerprint)
         self.assertIsNone(buffer.observation_keys)
-        self.composite.add_source('buffer', buffer)
+        self.add_source('buffer', buffer)
         buffer.update_cache(torch.ones(1, 3, 2, 3), torch.ones(1, 1, 2, 3),
                             torch.eye(4)[None], new_intrinsics=torch.eye(3)[None], depth_alignment=False,
                             new_labels=torch.ones(1, 1, 2, 3, dtype=torch.int64))

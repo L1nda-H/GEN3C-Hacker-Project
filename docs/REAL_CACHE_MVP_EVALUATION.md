@@ -42,6 +42,22 @@ provide RGB, depth, geometry validity, and cameras. Geometry validity is separat
 from the object mask produced by SAM. The script uses `batch_0004` for the
 environment and `batch_0008` for the object source.
 
+Override these defaults with `--environment-batch` and `--object-batch`. For
+example, import the duck from `batch_0000` into `batch_0001`:
+
+```bash
+python -m scripts.evaluate_real_cache_mvp \
+  --environment-batch batch_0001 \
+  --object-batch batch_0000 \
+  --box 138 36 222 204 \
+  --target-base 160 220 \
+  --object-height 100 \
+  --output-dir outputs/duck_in_batch_0001
+```
+
+The box uses the 320 × 240 source preview coordinates. Inspect the segmentation
+and placement in the output before adjusting the box, target base, or height.
+
 ## 3. Run the script to export input previews
 
 ```bash

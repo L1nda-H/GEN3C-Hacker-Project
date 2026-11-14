@@ -170,6 +170,10 @@ def export_previews(cache, poses, intrinsics, root):
 @torch.inference_mode()
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--environment-batch", default="batch_0004",
+                        help="Environment batch under datasets/gen3c_examples (default: batch_0004)")
+    parser.add_argument("--object-batch", default="batch_0008",
+                        help="Object batch under datasets/gen3c_examples (default: batch_0008)")
     inputs = parser.add_mutually_exclusive_group()
     inputs.add_argument("--box", nargs=4, type=float, metavar=("X1", "Y1", "X2", "Y2"),
                         help="Segment and import an object from object_input.png (optional)")
@@ -222,9 +226,9 @@ def main(argv=None):
     root.mkdir(parents=True, exist_ok=True)
 
     preview_only = args.box is None and not args.remove_environment_box
-    sources = {"environment": load_source("batch_0004")}
+    sources = {"environment": load_source(args.environment_batch)}
     if args.box is not None or preview_only:
-        sources["object"] = load_source("batch_0008")
+        sources["object"] = load_source(args.object_batch)
     for name, prepared in sources.items():
         rgb_image(prepared.observations[KEY].rgb).save(root / f"{name}_input.png")
     if preview_only:

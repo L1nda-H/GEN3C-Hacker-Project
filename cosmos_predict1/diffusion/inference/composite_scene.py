@@ -198,7 +198,8 @@ def build_composite_scene(scene: SceneSpec, *, device='cpu'):
             mask=obs.geometry_mask[None],
         )
         child = Cache3D_Base(**kwargs, device=device)
-        composite.add_source(source.source_id, child, is_environment=source.source_id == scene.environment_source)
+        composite.add_source(source.source_id, child, is_environment=source.source_id == scene.environment_source,
+                             source_w2c=obs.w2c, source_intrinsics=obs.intrinsics)
         composite.set_selection(source.source_id, source.selected_ids)
         composite.set_transform(source.source_id, _transform(source.source_transform))
         for instance_id, matrix in source.object_transforms.items():

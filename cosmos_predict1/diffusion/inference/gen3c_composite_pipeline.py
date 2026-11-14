@@ -81,6 +81,7 @@ class Gen3cCompositePipeline:
                         conditioning_strategy='per_source_latent_concat',
                         conditioning_visibility='joint_nearest_surface',
                         depth_tolerance=composite.depth_tolerance,
+                        renderer=composite.render_settings,
                         min_seed_coverage=min_seed_coverage)
 
         def record(**changes):

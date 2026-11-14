@@ -13,7 +13,12 @@ import torch
 
 from cosmos_predict1.diffusion.inference.cache_3d import Cache3D_Base
 from cosmos_predict1.diffusion.inference.camera_validation import validate_opencv_cameras
-from cosmos_predict1.diffusion.inference.forward_warp_utils_pytorch import nearest_surface_winners
+from cosmos_predict1.diffusion.inference.forward_warp_utils_pytorch import (
+    adaptive_surface_winners, pixel_cell_winner_depth,
+)
+
+_CANDIDATE_BATCH_SIZE = 262144
+_SUPPORT_DEPTH_TOLERANCE = .05
 
 
 def combine_visible_buffers(rgb, coverage):
@@ -32,6 +37,7 @@ class CompositeSamples:
     """One source/object's valid samples, in original row-major pixel order.
 
     points and rgb are [K,3]; pixel_indices is [K] on the source image grid.
+    Tangents are [K,2,3] full source-pixel steps in destination world.
     RGB is omitted for depth-only rendering. Returned tensors own their storage
     so consumers cannot edit child tensors.
     """
@@ -41,6 +47,7 @@ class CompositeSamples:
     points: torch.Tensor
     rgb: torch.Tensor | None
     pixel_indices: torch.Tensor
+    tangents: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -50,6 +57,7 @@ class _SampleTable:
     points: torch.Tensor
     colors: torch.Tensor | None
     metadata: torch.Tensor | None
+    tangents: torch.Tensor
 
 
 class Cache3D_Composite:
@@ -64,6 +72,8 @@ class Cache3D_Composite:
     Frame/point chunks bound projection memory; outputs use the camera device.
     Private CPU sample tables persist across renders. Change selections and
     placement through setters; call refresh_source after direct child edits.
+    Rendering needs original source cameras supplied to add_source(). The
+    candidate budget bounds expanded pixel batches, never footprint extent.
     """
 
     def __init__(self, *, rgb_range=(-1., 1.), image_size=None, depth_tolerance=1e-5,
@@ -95,6 +105,7 @@ class Cache3D_Composite:
         self._sample_tables = {}
         self._joint_table = None
         self._table_rgb_range = self.rgb_range
+        self._source_cameras = {}
 
     def _invalidate_samples(self, source_id=None):
         if source_id is None:
@@ -102,6 +113,14 @@ class Cache3D_Composite:
         else:
             self._sample_tables.pop(source_id, None)
         self._joint_table = None
+
+    @property
+    def render_settings(self):
+        """Runtime renderer settings for reproducible review manifests."""
+        return dict(candidate_batch_size=_CANDIDATE_BATCH_SIZE,
+                    support_depth_tolerance=_SUPPORT_DEPTH_TOLERANCE,
+                    depth_tolerance=self.depth_tolerance,
+                    frame_chunk_size=self.frame_chunk_size, point_chunk_size=self.point_chunk_size)
 
     @staticmethod
     def _identity():
@@ -199,13 +218,21 @@ class Cache3D_Composite:
             self.refresh_source(source_id)
         return cache
 
-    def add_source(self, source_id, cache, is_environment=False):
+    def add_source(self, source_id, cache, is_environment=False, *, source_w2c=None, source_intrinsics=None):
         """Register unchanged child geometry; positive objects start unselected."""
         if not isinstance(source_id, str) or not source_id or source_id in self.sources:
             raise ValueError("Source IDs must be unique nonempty strings")
         if is_environment and self.environment_source_id is not None:
             raise ValueError("Exactly one source may supply the environment")
         self._validate_source(source_id, cache)
+        if source_w2c is not None or source_intrinsics is not None:
+            if (source_w2c is None or source_intrinsics is None
+                    or source_w2c.shape != (4, 4) or source_intrinsics.shape != (3, 3)):
+                raise ValueError("Source camera requires w2c [4,4] and intrinsics [3,3]")
+            pose = source_w2c.detach().cpu().float().clone()
+            intrinsic = source_intrinsics.detach().cpu().float().clone()
+            validate_opencv_cameras(pose, intrinsic)
+            self._source_cameras[source_id] = (pose, intrinsic)
         self.sources[source_id] = cache
         self.selections[source_id] = frozenset({0} if is_environment else ())
         self.source_transforms[source_id] = self._identity()
@@ -257,6 +284,43 @@ class Cache3D_Composite:
             self.object_transforms[key] = matrix
             self._placement_conflicts.discard(key)
 
+    def _source_pixel_tangents(self, source_id, cache):
+        """Full source-pixel steps in world space, without crossing label/depth edges.
+
+        Average compatible one-sided differences; missing axes use a conservative
+        frontoparallel cell at source camera-Z. Source cameras are runtime-only.
+        """
+        if source_id not in self._source_cameras:
+            raise ValueError(f"Adaptive source {source_id!r} requires source_w2c and source_intrinsics")
+        pose, intrinsic = self._source_cameras[source_id]
+        height, width = cache.input_image.shape[-2:]
+        points = cache.input_points.reshape(height, width, 3).float()
+        depth = (points * pose[2, :3]).sum(-1) + pose[2, 3]
+        labels = cache.input_labels.reshape(height, width)
+        valid = (cache.input_mask.reshape(height, width).bool() & torch.isfinite(points).all(-1)
+                 & torch.isfinite(depth) & (depth > 0))
+        directions = torch.linalg.inv(intrinsic)[:, :2].T @ pose[:3, :3]
+        fallback = torch.where(valid, depth, 0.)[..., None, None] * directions
+        tangents = fallback.clone()
+        for tangent_axis, grid_axis in ((0, 1), (1, 0)):
+            left, right = [slice(None)] * 2, [slice(None)] * 2
+            left[grid_axis], right[grid_axis] = slice(None, -1), slice(1, None)
+            left, right = tuple(left), tuple(right)
+            compatible = (valid[left] & valid[right] & (labels[left] == labels[right])
+                          & ((depth[left] - depth[right]).abs()
+                             <= _SUPPORT_DEPTH_TOLERANCE * torch.minimum(depth[left], depth[right])))
+            difference = torch.where(compatible[..., None], points[right] - points[left], 0.)
+            total = torch.zeros_like(points)
+            count = torch.zeros_like(depth)
+            total[left] += difference
+            total[right] += difference
+            count[left] += compatible
+            count[right] += compatible
+            tangents[..., tangent_axis, :] = torch.where(
+                (count > 0)[..., None], total / count.clamp_min(1)[..., None], fallback[..., tangent_axis, :],
+            )
+        return tangents.reshape(-1, 2, 3)
+
     def _iter_render_inputs(self, *, include_rgb=True, source_ids=None):
         """Yield selected valid samples in deterministic source/object order.
 
@@ -275,6 +339,7 @@ class Cache3D_Composite:
                 raise ValueError("Merged objects have conflicting transforms; call set_transform again")
             inputs.append((source_id, cache, selected))
         for source_id, cache, selected in inputs:
+            support = self._source_pixel_tangents(source_id, cache) if selected else None
             points = cache.input_points.reshape(-1, 3)
             rgb = cache.input_image[0, 0, 0, 0].permute(1, 2, 0).reshape(-1, 3) if include_rgb else None
             labels = cache.input_labels.reshape(-1)
@@ -286,13 +351,16 @@ class Cache3D_Composite:
                 transform = (self.source_transforms[source_id] @ self.object_transforms.get(
                     (source_id, instance_id), self._identity())).to(torch.float32)
                 transformed = points[indices].to(torch.float32) @ transform[:3, :3].T + transform[:3, 3]
-                yield CompositeSamples(source_id, instance_id, transformed, rgb[indices] if include_rgb else None, indices)
+                tangents = support[indices] @ transform[:3, :3].T
+                yield CompositeSamples(source_id, instance_id, transformed, rgb[indices] if include_rgb else None,
+                                       indices, tangents)
 
-    def _resolve_visibility(self, points, poses, intrinsics):
+    def _resolve_visibility(self, points, poses, intrinsics, tangents):
         """Replaceable visibility policy; ranks follow source/object/pixel order."""
-        return nearest_surface_winners(
-            points, poses, intrinsics, self.image_size,
+        return adaptive_surface_winners(
+            points, tangents, poses, intrinsics, self.image_size,
             depth_tolerance=self.depth_tolerance, point_chunk_size=self.point_chunk_size,
+            candidate_batch_size=_CANDIDATE_BATCH_SIZE,
         )
 
     def _target_cameras(self, target_w2cs, target_intrinsics, start_frame_idx):
@@ -318,8 +386,7 @@ class Cache3D_Composite:
         with torch.autocast(device_type=poses.device.type, enabled=False):
             return self._render_frames(poses, intrinsics, rgb=rgb, depth=depth, diagnostics=diagnostics)
 
-    @staticmethod
-    def _supports(table, rgb, diagnostics):
+    def _supports(self, table, rgb, diagnostics):
         return (table is not None and (not rgb or table.colors is not None)
                 and (not diagnostics or table.metadata is not None))
 
@@ -355,7 +422,9 @@ class Cache3D_Composite:
                                  torch.full_like(s.pixel_indices, s.instance_id), s.pixel_indices], dim=-1)
                     for s in samples
                 ]) if samples else torch.empty(0, 3, dtype=torch.int64)
-            self._sample_tables[source_id] = _SampleTable(points, colors, metadata)
+            tangents = (torch.cat([s.tangents for s in samples]) if samples
+                        else torch.empty(0, 2, 3, dtype=torch.float32))
+            self._sample_tables[source_id] = _SampleTable(points, colors, metadata, tangents)
             self._joint_table = None
         return source_ids
 
@@ -371,6 +440,7 @@ class Cache3D_Composite:
                     torch.cat([t.points for t in tables]),
                     torch.cat([t.colors for t in tables]) if rgb else None,
                     torch.cat([t.metadata for t in tables]) if diagnostics else None,
+                    torch.cat([t.tangents for t in tables]),
                 )
         return self._joint_table
 
@@ -395,7 +465,7 @@ class Cache3D_Composite:
             nearest_depth = torch.zeros_like(coverage)
         for start in range(0, frames, self.frame_chunk_size):
             end = min(start + self.frame_chunk_size, frames)
-            winner, nearest = self._resolve_visibility(points, poses[start:end], intrinsics[start:end])
+            winner, nearest = self._resolve_visibility(points, poses[start:end], intrinsics[start:end], table.tangents)
             if diagnostics:
                 nearest_depth[start * pixels:end * pixels] = nearest.reshape(-1)
             winner = winner.reshape(-1)
@@ -415,9 +485,11 @@ class Cache3D_Composite:
                     image[destination] = colors[rank].to(device)
                 if depth:
                     chosen = points[rank].to(device)
-                    # Preserve the selected point's actual camera-Z, including
-                    # when categorical priority chooses a near-equal surface.
-                    z_buffer[destination] = (chosen * poses[frame, 2, :3]).sum(-1) + poses[frame, 2, 3]
+                    pixel = (offset + covered) % pixels
+                    xy = torch.stack((pixel % width, pixel // width), -1).float()
+                    z_buffer[destination] = pixel_cell_winner_depth(
+                        chosen, table.tangents[rank].to(device), poses[frame], intrinsics[frame], xy,
+                    )
                 if diagnostics:
                     winners[destination] = metadata[rank].to(device)
         result = dict(coverage=coverage.reshape(1, frames, slots, 1, height, width))

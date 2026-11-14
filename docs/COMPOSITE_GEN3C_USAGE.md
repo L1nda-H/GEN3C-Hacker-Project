@@ -136,6 +136,43 @@ frame as its seed. Source caches remain static and generated-frame cache
 updates are disabled. Video segments are concatenated once after generation.
 Persistent-server support remains deferred.
 
+## Adaptive pixel coverage
+
+The composite pipeline always projects each sample's source-pixel cell instead
+of only its center. There is no rendering-mode flag. Previews and conditioning
+share the same joint depth test, using
+ray-plane depth at each target pixel. Large valid cells are clipped to the image
+and streamed without a size-triggered fallback to points. This improves sampling
+coverage under magnification; it does not reconstruct unseen geometry.
+
+The renderer uses fixed internal defaults: batches of at most 262,144 expanded
+point–pixel candidates and a 5% relative source-depth threshold for estimating
+support from neighbors. Batching bounds temporary memory without changing
+coverage. The depth threshold helps avoid connecting foreground and background.
+Neither is a CLI flag or public renderer option. Neighbors must also be valid
+and share the same canonical label. Missing axes use a frontoparallel source-pixel
+estimate; degenerate cells or cells crossing the target near plane fall back to
+point projection. Independent cells can leave seams on curved/noisy geometry,
+and silhouette accuracy still requires real-source inspection.
+
+Use `build_composite_scene(scene)` or `Gen3cCompositePipeline.generate()` normally;
+no rendering configuration is required. Direct `Cache3D_Composite` callers
+provide `source_w2c=[4,4]` and `source_intrinsics=[3,3]` tensors in `add_source()`.
+The scene builder supplies those runtime cameras automatically. No cache,
+scene, or prepared-source artifact migration is required. `generation.json`
+records the actual renderer settings under `renderer`.
+
+For a synthetic preview without model weights:
+
+```bash
+python -m scripts.preview_composite_render \
+    --output-dir outputs/composite_adaptive_preview
+```
+
+CPU tests establish contract and synthetic geometry behavior; CUDA render time,
+peak memory, real-image silhouettes and moving-camera GEN3C quality remain
+manual acceptance checks.
+
 ## Review artifacts
 
 The CLI saves `<name>.mp4` and `<name>_review/` containing:

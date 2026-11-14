@@ -50,8 +50,8 @@ def make_scene():
     prop_k[:2, 2] = torch.tensor([12., 12.])
     prop = cache('prop', prop_rgb, torch.full((24, 24), 3.), prop_k, torch.ones(24, 24, dtype=torch.int64))
     scene = Cache3D_Composite(image_size=(height, width), point_chunk_size=1024)
-    scene.add_source('room', room, is_environment=True)
-    scene.add_source('prop', prop)
+    scene.add_source('room', room, is_environment=True, source_w2c=torch.eye(4), source_intrinsics=intrinsics)
+    scene.add_source('prop', prop, source_w2c=torch.eye(4), source_intrinsics=prop_k)
     scene.set_selection('prop', [1])
     placement = torch.eye(4)
     placement[:3, 3] = torch.tensor([.225, .075, 0.])
@@ -74,6 +74,7 @@ def main():
         args.output_dir / 'buffers.npz', rgb=rgb.numpy(), coverage=coverage.numpy(), depth=depth.numpy(),
         winners=diagnostics['winners'].numpy(), source_ids=np.array(diagnostics['source_ids']),
         nearest_depth=diagnostics['nearest_depth'].numpy(), w2cs=poses.numpy(), intrinsics=intrinsics.numpy(),
+        candidate_batch_size=scene.render_settings['candidate_batch_size'],
     )
     h, w = scene.image_size
     sheet = Image.new('RGB', (3 * w, 3 * (h + 16)), '#202020')

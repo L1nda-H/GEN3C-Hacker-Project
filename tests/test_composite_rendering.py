@@ -32,8 +32,20 @@ def cameras(frames=1):
     return torch.eye(4).repeat(1, frames, 1, 1), torch.eye(3).repeat(1, frames, 1, 1)
 
 
+class IsolatedSampleComposite(Cache3D_Composite):
+    """Independent point fixtures have no connected source-pixel surface.
+
+    Degenerate support exercises the adaptive renderer's point fallback and
+    isolates its visibility/ownership contracts. Organized source surfaces use
+    production support estimation in test_adaptive_splatting/test_composite_pipeline.
+    """
+
+    def _source_pixel_tangents(self, source_id, cache):
+        return torch.zeros(cache.input_points.numel() // 3, 2, 3)
+
+
 def composite(environment, *objects, **options):
-    result = Cache3D_Composite(image_size=options.pop('image_size', (3, 4)), **options)
+    result = IsolatedSampleComposite(image_size=options.pop('image_size', (3, 4)), **options)
     result.add_source(environment.object_registry.source_id, environment, is_environment=True)
     for cache in objects:
         name = cache.object_registry.source_id
@@ -285,7 +297,7 @@ class RenderingTests(unittest.TestCase):
         env = source('a', [[0, 0, 2]], colors=[[-1, -1, 1]])
         obj = source('z', [[0, 0, 2]], ids=[1])
         baseline = self.render(composite(env, obj, depth_tolerance=0))
-        scene = Cache3D_Composite(image_size=(3, 4), depth_tolerance=0)
+        scene = IsolatedSampleComposite(image_size=(3, 4), depth_tolerance=0)
         scene.add_source('z', obj)
         scene.set_selection('z', [1])
         scene.add_source('a', env, is_environment=True)
@@ -365,6 +377,7 @@ class RenderingTests(unittest.TestCase):
         self.assertFalse(empty['coverage'].any())
         self.assertTrue((empty['winners'] == -1).all())
 
+    @patch('cosmos_predict1.diffusion.inference.cache3d_composite._CANDIDATE_BATCH_SIZE', 4)
     def test_output_allocations_and_winner_gathers_are_bounded(self):
         # Three points cover nine pixels across frames. Four-sample batches
         # therefore exercise both a frame boundary and a partial final batch.
