@@ -1,0 +1,44 @@
+"""Preview the initial seed on CPU without loading diffusion or SAM weights."""
+
+import argparse
+import json
+from pathlib import Path
+
+from cosmos_predict1.diffusion.inference.cache3d_composite import combine_visible_buffers
+from cosmos_predict1.diffusion.inference.composite_scene import SceneSpec, build_composite_scene
+from cosmos_predict1.diffusion.inference.composite_seed import prepare_initial_seed
+from cosmos_predict1.diffusion.inference.composite_review import save_seed, save_seed_result, save_manifest
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--scene-spec', required=True)
+    parser.add_argument('--output-dir', required=True, type=Path)
+    parser.add_argument('--seed-strategy', choices=('rendered', 'image_space', 'provided'), default='image_space')
+    parser.add_argument('--seed-image')
+    parser.add_argument('--seed-plane-depths', type=json.loads)
+    parser.add_argument('--seed-occlusion-policy', choices=('reject', 'allow'), default='reject')
+    parser.add_argument('--compare-rendered', action='store_true')
+    args = parser.parse_args()
+    scene = SceneSpec.load(args.scene_spec)
+    composite = build_composite_scene(scene)
+    result = prepare_initial_seed(scene, composite, strategy=args.seed_strategy,
+                                  provided_seed=args.seed_image, plane_depths=args.seed_plane_depths,
+                                  occlusion_policy=args.seed_occlusion_policy)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    scene.save(args.output_dir / 'scene.json')
+    if result is not None:
+        save_seed_result(args.output_dir, result)
+    if result is None or args.compare_rendered:
+        poses, intrinsics = scene.cameras()
+        buffers = composite.render_conditioning(poses[:, :1], intrinsics[:, :1])
+        rgb, coverage = combine_visible_buffers(buffers['rgb'], buffers['coverage'])
+        directory = args.output_dir if result is None else args.output_dir / 'rendered_seed'
+        directory.mkdir(exist_ok=True)
+        save_seed(directory, rgb[:, 0, 0].unsqueeze(2))
+        save_manifest(directory, dict(strategy='rendered', seed_coverage=float(coverage.mean())))
+    print(f'Saved seed preview to {args.output_dir}')
+
+
+if __name__ == '__main__':
+    main()

@@ -141,6 +141,8 @@ h, w = scene.image_size
 k = intrinsics[:, :1].repeat(1, 121, 1, 1)
 k[..., 0, :] *= 1280 / w
 k[..., 1, :] *= 704 / h
+k[..., 0, 2] += (1280 / w - 1) / 2
+k[..., 1, 2] += (704 / h - 1) / 2
 scene.target_w2cs = target
 scene.target_intrinsics = k
 scene.image_size = (704, 1280)
@@ -175,6 +177,26 @@ buffer previews, and `generation.json` alongside the video. If seed coverage
 fails, inspect those artifacts and fix the scene. If CUDA runs out of memory
 with these offload flags, use a GPU with more VRAM; successful `nvidia-smi`
 alone does not establish sufficient memory.
+
+To compare a seed stitched from source RGB against the adaptive rendered seed,
+first preview it at output resolution (using the pixel-center intrinsics
+conversion in step 5):
+
+```bash
+OMP_NUM_THREADS=4 python -m scripts.preview_composite_seed \
+  --scene-spec outputs/gcp_composite_inputs/scene_121.json \
+  --output-dir outputs/candle_seed_preview --compare-rendered
+```
+
+Inspect `seed.png` and the comparison in `rendered_seed/`. If uncertain
+occlusion is reported, inspect the depth or rerun with
+`--seed-occlusion-policy allow` to save a preview with flagged regions in
+`seed_uncertainty.png`. This explicitly accepts uncertain depth decisions.
+Then add `--seed_strategy image_space` to the inference command (and
+`--seed_occlusion_policy allow` only if that policy was inspected and chosen).
+Use a new output name/directory for the comparison. The warp buffers stay the
+same, so this isolates the seed change. Nonplanar objects may need placement
+adjustment when represented as textured planes.
 
 More options: [composite usage](COMPOSITE_GEN3C_USAGE.md) and
 [segmentation/placement examples](REAL_CACHE_MVP_EVALUATION.md).

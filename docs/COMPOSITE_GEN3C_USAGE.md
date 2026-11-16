@@ -101,7 +101,7 @@ output = Gen3cCompositePipeline(diffusion_pipeline).generate(
 # output is (uint8_video_THWC, final_prompt), or None if a guardrail blocks a chunk.
 ```
 
-The first camera must cover at least half of the output pixels by default.
+With the default rendered seed, the first camera must cover at least half of the output pixels.
 `--min_seed_coverage` adjusts that threshold. Insufficient coverage saves the
 seed and previews, then raises an error so the scene author can choose a better
 starting camera; camera order is never changed automatically. Seed holes use
@@ -127,7 +127,7 @@ the paper's feature max pooling.
 
 `render_cache()` and `render_diagnostics()` return combined scene renders;
 `render_conditioning()` routes the same joint winners into separate source
-buffers. The initial seed and preview joint images are recombined from visible
+buffers. The default rendered seed and preview joint images are recombined from visible
 buffers without another projection. Recombination sums covered RGB only and
 fills uncovered pixels with -1. Rendering does not fill gaps between points.
 
@@ -202,3 +202,74 @@ diagnostics. Review depth is released before diffusion, and conditioning buffers
 before the next chunk.
 Other ranks omit review-only buffers, hashes, and files. Source provenance comes
 from the already validated label records. Preview tools retain full diagnostics.
+
+## Image-space and supplied seeds
+
+`--seed_strategy rendered` retains the existing default. To construct the first
+seed directly from source RGB, use `--seed_strategy image_space`. Warp RGB and
+coverage masks are unchanged; continuation chunks still use the last generated
+frame. This is a seed-only experiment and cannot prevent artifacts from damaged
+warp conditioning.
+
+Preview the seed on CPU before loading diffusion weights:
+
+```bash
+OMP_NUM_THREADS=4 python -m scripts.preview_composite_seed \
+  --scene-spec outputs/gcp_composite_inputs/scene_121.json \
+  --output-dir outputs/seed_preview --compare-rendered
+```
+
+The first camera must match the environment's source pose, and its field of
+view must lie within the source image. RGB is sampled directly with bilinear
+interpolation and edge extension within source pixel cells. Preserve pixel
+centers when resizing intrinsics: scale each row, then add `(scale - 1) / 2`
+to that row's principal point. Removed/unresolved valid environment content or
+moved environment objects require a supplied seed or the rendered strategy.
+
+Each selected imported object becomes a textured source-camera plane at its
+median valid depth, transformed by its existing scene placement. This avoids
+per-pixel depth slopes and their slivers, but can change a nonplanar object's
+apparent size or position. Inspect the preview and adjust placement deliberately.
+Override a proxy depth, in source-camera units, with
+`--seed_plane_depths '{"object:1": 16.0}'` (preview: `--seed-plane-depths`).
+Unknown object keys and invalid depths are errors.
+
+Visibility compares plane camera-Z against nearest-sampled environment depth
+and other planes. Alpha edges use premultiplied RGB to avoid black fringes.
+Per-pixel depth ordering handles intersecting planes. Equal-depth object ties
+prefer sorted source ID then instance ID; environment ties use the renderer's
+absolute depth tolerance and source ordering.
+
+By default, overlaps with missing depth or local depth boundaries raise an
+error before diffusion weights load. Inspect the scene/depth, supply a corrected
+seed, or explicitly use `--seed_occlusion_policy allow` (preview:
+`--seed-occlusion-policy allow`). This draws objects over missing environment
+depth and uses the available depth at uncertain boundaries; the uncertain
+regions are saved, not treated as reliable geometry.
+
+For a manually prepared seed use `--seed_strategy provided --seed_image seed.png`.
+It must be an RGB image at exactly the scene output dimensions, with no alpha
+channel; no automatic resizing occurs. Its SHA256 is recorded. Preview supports
+`--seed-strategy provided --seed-image seed.png`.
+
+Python callers use `seed_strategy`, `seed_image`, `seed_plane_depths` (a dict),
+and `seed_occlusion_policy` arguments on `generate()`. The default seed coverage
+threshold still applies to rendered seeds. Alternative seeds have complete RGB;
+this does not imply complete or trustworthy 3D geometry.
+
+Additional review files for alternative seeds:
+
+- `rendered_seed/seed.png` and `.npy`: the original adaptive seed for comparison.
+- `seed_metadata.json`: strategy, plane depths and projected bounds, explicit
+  uncertainty policy, and source ownership index ordering (or supplied image hash).
+- `seed_diagnostics.npz`: ownership `(source index, canonical object ID)`, proxy
+  depth (zero for background), uncertainty, observed/synthesized RGB masks, and
+  environment depth validity for image-space seeds. Antialiased pixels may mix
+  multiple layers; ownership identifies the nearest contributing layer.
+- `seed_uncertainty.png` and other diagnostic masks: white marks true pixels.
+  Observed means RGB sampled from sources, not measured target-view geometry;
+  this version synthesizes no missing RGB through inpainting.
+
+The CPU preview writes these seed files and a resolved scene, and optionally
+`rendered_seed/`. Full generation also records seed metadata and
+`rendered_seed_coverage` in `generation.json`.

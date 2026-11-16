@@ -32,6 +32,55 @@ from cosmos_predict1.diffusion.inference.instance_segmentation import (
 
 
 class CompositePipelineTests(unittest.TestCase):
+    def test_provided_seed_is_used_and_invalid_image_space_seed_fails_before_diffusion(self):
+        from PIL import Image
+        image = self.root / 'provided.png'
+        Image.new('RGB', (self.w, self.h), 'white').save(image)
+        self.generate(seed_strategy='provided', seed_image=image)
+        seed = self.diffusion.generate.call_args_list[0].kwargs['image_path']
+        torch.testing.assert_close(seed, torch.ones_like(seed))
+        manifest = json.loads((self.review / 'generation.json').read_text())
+        self.assertEqual(len(manifest['seed_metadata']['sha256']), 64)
+        self.diffusion.generate.reset_mock()
+        scene = deepcopy(self.scene)
+        scene.target_w2cs[0, 0, 0, 3] = .1
+        with self.assertRaisesRegex(ValueError, 'first camera'):
+            self.generate(scene, seed_strategy='image_space')
+        self.diffusion.generate.assert_not_called()
+        self.assertEqual(json.loads((self.review / 'generation.json').read_text())['status'], 'failed')
+
+    def test_image_space_seed_repairs_seed_only_and_preserves_continuation(self):
+        composite = build_composite_scene(self.scene)
+        render = composite.render_conditioning
+
+        def cracked(*args, **kwargs):
+            buffers = render(*args, **kwargs)
+            buffers['rgb'][..., 0, -1] = -1
+            buffers['coverage'][..., 0, -1] = 0
+            if 'depth' in buffers:
+                buffers['depth'][..., 0, -1] = 0
+            return buffers
+
+        with patch.object(composite, 'render_conditioning', side_effect=cracked):
+            self.generate(prepared_composite=composite)
+            original = [call.kwargs for call in self.diffusion.generate.call_args_list]
+            self.diffusion.generate.reset_mock()
+            self.diffusion.generate.side_effect = [(v, 'final prompt') for v in self.segments]
+            self.generate(prepared_composite=composite, seed_strategy='image_space')
+        changed = [call.kwargs for call in self.diffusion.generate.call_args_list]
+        for a, b in zip(original, changed):
+            torch.testing.assert_close(a['rendered_warp_images'], b['rendered_warp_images'])
+            torch.testing.assert_close(a['rendered_warp_masks'], b['rendered_warp_masks'])
+        torch.testing.assert_close(original[0]['image_path'][0, :, 0, 0, -1], torch.full((3,), -1.))
+        torch.testing.assert_close(changed[0]['image_path'][0, :, 0, 0, -1], torch.tensor([-1., -1., 1.]))
+        torch.testing.assert_close(original[1]['image_path'], changed[1]['image_path'])
+        manifest = json.loads((self.review / 'generation.json').read_text())
+        self.assertEqual(manifest['seed_strategy'], 'image_space')
+        self.assertEqual(manifest['seed_coverage'], 1.)
+        self.assertLess(manifest['rendered_seed_coverage'], 1.)
+        self.assertTrue((self.review / 'seed_diagnostics.npz').exists())
+        self.assertTrue((self.review / 'rendered_seed/seed.png').exists())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
