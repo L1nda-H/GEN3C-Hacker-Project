@@ -11,6 +11,7 @@
 - [P1] Render objects in scenes with depth (objects in foreground should cover inserted object)
 - [P2] Fix object holes from sparse point clouds when object moves closer to camera
     - Possible approaches: adaptive splatting, fill in holes with coverage mask
+- Integrate MoGe with composite pipeline
 
 ## Inputs and outputs
 

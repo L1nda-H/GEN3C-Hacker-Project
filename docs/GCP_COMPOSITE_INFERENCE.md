@@ -1,7 +1,7 @@
 # Run composite Cache3D inference on GCP
 
 Run these blocks **in order, in the same Bash terminal on your GPU VM**.
-This example downloads two RGB-D sequences, imports the candle into the
+This example downloads all available RGB-D batches, imports the candle into the
 environment, and generates a 121-frame video. No training dataset is needed.
 
 The repo reports roughly 43 GB GPU memory with full offloading for ordinary
@@ -29,6 +29,14 @@ Create the environment and install inference dependencies, following
 [INSTALL.md](../INSTALL.md#inference). GPU drivers alone are insufficient.
 Replace the repository path if necessary. These installs can take time.
 
+Install the system OpenGL library required by `opencv-python` on a minimal
+Ubuntu/Debian VM. This also fixes `ImportError: libGL.so.1`:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libgl1
+```
+
 ```bash
 cd ~/GEN3C-Hacker-Project
 conda env create --file cosmos-predict1.yaml
@@ -41,11 +49,35 @@ ln -sf "$CONDA_PREFIX"/lib/python3.10/site-packages/nvidia/*/include/* "$CONDA_P
 ln -sf "$CONDA_PREFIX"/lib/python3.10/site-packages/nvidia/*/include/* "$CONDA_PREFIX/include/python3.10/"
 python -m pip install 'transformer-engine[pytorch]==1.12.0'
 if [ ! -d apex ]; then git clone https://github.com/NVIDIA/apex; fi
+# Pin Apex: current master uses annotations incompatible with PyTorch 2.6.
+git -C apex fetch origin e74a67bba3ee679f778670e17edc21639008ae0a
+git -C apex checkout --detach e74a67bba3ee679f778670e17edc21639008ae0a
 python -m pip install -v --disable-pip-version-check --no-cache-dir \
-  --no-build-isolation --config-settings '--build-option=--cpp_ext' \
+  --no-build-isolation --no-deps --force-reinstall \
+  --config-settings '--build-option=--cpp_ext' \
   --config-settings '--build-option=--cuda_ext' ./apex
-python -m pip install git+https://github.com/microsoft/MoGe.git
 ```
+
+MoGe is unnecessary for this composite workflow: the samples already contain
+depth and cameras. Skip the MoGe install in the general installation guide.
+Current [MoGe dependencies](https://github.com/microsoft/MoGe/blob/main/pyproject.toml)
+include NumPy 2 and Gradio, which conflict with this repo's older pins.
+
+If you already installed MoGe and it upgraded Hugging Face Hub or NumPy, repair
+the active `cosmos-predict1` environment before continuing:
+
+```bash
+conda activate cosmos-predict1
+python -m pip uninstall -y moge gradio gradio-client hf-gradio opencv-python-headless
+# Both OpenCV packages share cv2; reinstall the repo's package after removal.
+python -m pip install --force-reinstall --no-deps \
+  huggingface-hub==0.29.2 numpy==1.26.4 opencv-python==4.10.0.84
+python -m pip check
+python -c 'import cv2, numpy, transformers, huggingface_hub; print(cv2.__version__, numpy.__version__, transformers.__version__, huggingface_hub.__version__)'
+```
+
+Resolve any remaining `pip check` conflicts before running inference. This
+repair restores the affected repository pins without reinstalling PyTorch or Apex.
 
 ## 1. Activate GEN3C and check CUDA
 
@@ -65,6 +97,35 @@ Resolve any environment-check errors before continuing. Your checkout must
 contain `cosmos_predict1/diffusion/inference/gen3c_composite.py` and
 `scripts/evaluate_real_cache_mvp.py`.
 
+If importing `megatron.core` fails inside Transformer Engine with
+`ldconfig -p | grep 'libnvrtc'`, NVRTC was not found. Transformer Engine
+searches `CUDA_HOME` recursively before checking the system library cache:
+
+```bash
+conda activate cosmos-predict1
+export CUDA_HOME="$CONDA_PREFIX"
+python -c 'import megatron.core; import transformer_engine.pytorch; print("Megatron and Transformer Engine OK")'
+```
+
+Keep `CUDA_HOME` exported in the inference terminal. If the same NVRTC lookup
+still fails, check whether the environment contains the runtime compiler:
+
+```bash
+find "$CONDA_PREFIX" -name 'libnvrtc.so*'
+# Only if no library is found; matches cosmos-predict1.yaml's CUDA version:
+conda install -y -c conda-forge cuda-nvrtc=12.4
+```
+
+Then repeat the import check. NVRTC is CUDA's runtime compiler library;
+this traceback does not mean Megatron itself is missing.
+
+If that check instead fails inside Apex with
+`normalized_shape has unsupported type list[int]`, rebuild Apex using the
+pinned fetch/checkout and pip commands in step 0 (after exporting `CUDA_HOME`).
+The pinned source uses `typing.List[int]` and `typing.Tuple`, accepted by the
+repo's PyTorch 2.6 schema parser. The reinstall retains the PyTorch version;
+it rebuilds Apex's C++/CUDA extensions. Repeat the import check afterward.
+
 ## 2. Download inference checkpoints
 
 Log in with a Hugging Face read token; accept any requested model access terms
@@ -76,16 +137,18 @@ huggingface-cli login
 python scripts/download_gen3c_checkpoints.py --checkpoint_dir checkpoints
 ```
 
-## 3. Download just the two sample sequences and SAM weights
+## 3. Download all sample batches and SAM weights
 
 The [NVIDIA sample dataset](https://huggingface.co/datasets/nvidia/GEN3C-Testing-Example/tree/main)
-includes RGB, depth, validity masks, and cameras. The script expects this exact
-local directory layout.
+includes RGB, depth, validity masks, and cameras. It lists 10 batches,
+`batch_0000` through `batch_0009`; the wildcard downloads all of them.
+The script expects this exact local directory layout. Already downloaded files
+are reused.
 
 ```bash
 huggingface-cli download nvidia/GEN3C-Testing-Example \
   --repo-type dataset \
-  --include 'batch_0004/*' 'batch_0008/*' \
+  --include 'batch_*/*' \
   --local-dir datasets/gen3c_examples
 
 mkdir -p checkpoints
@@ -157,6 +220,11 @@ Offloading reduces GPU memory use. This run disables guardrails, keeps the
 text encoder enabled for your prompt, and uses no prompt upsampler.
 
 ```bash
+cd ~/GEN3C-Hacker-Project
+conda activate cosmos-predict1
+export CUDA_HOME="$CONDA_PREFIX"
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+python -c 'import torch; import megatron.core; import transformer_engine.pytorch; print("Imports OK")'
 set -o pipefail
 mkdir -p outputs/gcp_composite
 python -m cosmos_predict1.diffusion.inference.gen3c_composite \
