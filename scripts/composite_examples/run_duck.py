@@ -72,7 +72,7 @@ def preflight(args):
 
 
 EXAMPLE = 'duck'
-PROMPT = 'A giant yellow rubber duck sitting on the ocean surface in a seaside town harbor. Its red feet touch the water, with a natural water contact and small ripples around its base. The entire duck including its feet is about half the image height.'
+PROMPT = 'A giant yellow rubber duck sitting on the ocean surface in a seaside town harbor. Its red feet touch the water, with a natural water contact and small ripples around its base.'
 
 
 def prepare(args, root):

@@ -72,7 +72,7 @@ def preflight(args):
 
 
 EXAMPLE = 'creature'
-PROMPT = 'A small furry fantasy creature with large pointed ears sitting on the bed beside a sleeping woman. The creature occupies the former position of the orange cat. Natural striped bedding surrounds it, with no cat and no candle.'
+PROMPT = 'A small furry fantasy creature with large pointed ears sitting on the bed beside a sleeping woman. The creature is pawing at the blanket that covers the sleeping woman.'
 
 
 def prepare(args, root):

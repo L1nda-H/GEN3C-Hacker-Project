@@ -72,7 +72,7 @@ def preflight(args):
 
 
 EXAMPLE = 'cat'
-PROMPT = 'A small orange cat sitting on the tabletop to the man’s right, on the left side of the image. The cat is in front of the man and behind the foreground computer monitor, which partially occludes the cat. Between his hands is a lit red candle with melted wax and a wax puddle at its base. His hands naturally surround the candle; the handheld camera has been removed.'
+PROMPT = 'An orange cat sitting on the tabletop behind the monitor next to the man. The man cups a lit red candle with a melted wax puddle at the base between his hands. The cat is batting at the tip of the candle flame. They are sitting in a video recording studio.'
 
 
 def prepare(args, root):
