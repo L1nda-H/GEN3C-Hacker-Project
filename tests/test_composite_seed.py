@@ -1,17 +1,19 @@
 """Image-space seed appearance, proxy geometry, and applicability."""
 from types import SimpleNamespace
-import tempfile
+import os
 from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
-from PIL import Image
 import torch
 
 from tests.test_composite_rendering import source
 from tests.test_adaptive_splatting import grid_points
 from cosmos_predict1.diffusion.inference.cache3d_composite import Cache3D_Composite
-from cosmos_predict1.diffusion.inference.composite_seed import build_image_space_seed, prepare_initial_seed
+from cosmos_predict1.diffusion.inference.composite_seed import build_image_space_seed
+from tests.test_lama_inpainting import checkpoint
 
 
 class CompositeSeedTests(unittest.TestCase):
@@ -98,7 +100,7 @@ class CompositeSeedTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'field of view'):
             build_image_space_seed(scene, c, torch.eye(4), wide)
         c.sources['room'].input_labels[..., 0, 0] = -1
-        with self.assertRaisesRegex(ValueError, 'removed or unresolved'):
+        with self.assertRaisesRegex(ValueError, 'resolved environment labels'):
             self.build((scene, c, k))
         c.sources['room'].input_labels[..., 0, 0] = 0
         transform = torch.eye(4); transform[2, 3] = -3
@@ -129,18 +131,79 @@ class CompositeSeedTests(unittest.TestCase):
         self.assertIn(0, ids)
         self.assertIn(2, ids)
 
-    def test_provided_seed_validation_and_provenance(self):
-        with tempfile.TemporaryDirectory() as root:
-            path = Path(root)/'seed.png'
-            Image.new('RGB', (8, 8), 'red').save(path)
-            result = prepare_initial_seed(SimpleNamespace(image_size=(8, 8)), None,
-                                          strategy='provided', provided_seed=path)
-            self.assertEqual(len(result.metadata['sha256']), 64)
-            with self.assertRaisesRegex(ValueError, 'dimensions'):
-                prepare_initial_seed(SimpleNamespace(image_size=(9, 8)), None,
-                                     strategy='provided', provided_seed=path)
-            with self.assertRaisesRegex(ValueError, 'required only'):
-                prepare_initial_seed(None, None, provided_seed=path)
+    def removal_fixture(self):
+        scene, previous, k = self.fixture()
+        colors = torch.tensor([[-1., -1, 1]]*64).reshape(8, 8, 3)
+        labels = torch.zeros(8, 8, dtype=torch.int64)
+        labels[3:5, 3:5] = 1
+        colors[3:5, 3:5] = torch.tensor([1., -1, -1])
+        env = source('room', previous.sources['room'].input_points, size=(8, 8),
+                     ids=labels.flatten().tolist(), colors=colors.reshape(-1, 3))
+        composite = Cache3D_Composite(image_size=scene.image_size)
+        composite.add_source('room', env, is_environment=True, source_w2c=torch.eye(4),
+                             source_intrinsics=previous._source_cameras['room'][1])
+        composite.add_source('object', previous.sources['object'], source_w2c=torch.eye(4),
+                             source_intrinsics=previous._source_cameras['object'][1])
+        return scene, composite, k
+
+    def test_removal_inpaints_rgb_without_mutating_or_filling_cache_geometry(self):
+        fixture = self.removal_fixture()
+        scene, composite, k = fixture
+        before = composite.render_conditioning(torch.eye(4)[None, None], k[None, None])
+        source_rgb = composite.sources['room'].input_image.clone()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'lama.pt'; checkpoint(path)
+            with patch.dict(os.environ, GEN3C_LAMA_MODEL=str(path), GEN3C_LAMA_CACHE=temporary):
+                result = self.build(fixture)
+                self.assertFalse(result.metadata['inpainting']['cache_hit'])
+                again = self.build(fixture)
+                self.assertTrue(again.metadata['inpainting']['cache_hit'])
+        torch.testing.assert_close(result.rgb, again.rgb)
+        torch.testing.assert_close(result.rgb[0, :, 0, 3, 3], torch.full((3,), -.5))
+        self.assertTrue(result.diagnostics['synthesized'][3, 3])
+        self.assertFalse(result.diagnostics['observed'][3, 3])
+        self.assertFalse(result.diagnostics['environment_depth_valid'][3, 3])
+        self.assertEqual(result.diagnostics['ownership'][3, 3, 1], -1)
+        self.assertEqual(float(before['coverage'].sum(2)[0, 0, 0, 3, 3]), 0.)
+        after = composite.render_conditioning(torch.eye(4)[None, None], k[None, None])
+        for key in before:
+            torch.testing.assert_close(before[key], after[key])
+        torch.testing.assert_close(source_rgb, composite.sources['room'].input_image)
+
+    def test_insert_over_synthesized_background_requires_explicit_occlusion_policy(self):
+        fixture = self.removal_fixture()
+        fixture[1].set_selection('object', [1])
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'lama.pt'; checkpoint(path)
+            with patch.dict(os.environ, GEN3C_LAMA_MODEL=str(path), GEN3C_LAMA_CACHE=temporary):
+                with self.assertRaisesRegex(ValueError, 'Uncertain environment occlusion'):
+                    self.build(fixture)
+                result = self.build(fixture, occlusion_policy='allow')
+        self.assertTrue(result.diagnostics['background_synthesized'][3, 3])
+        self.assertTrue(result.diagnostics['uncertainty'][3, 3])
+        self.assertFalse(result.diagnostics['synthesized'][3, 3])
+        self.assertTrue(result.diagnostics['observed'][3, 3])
+        self.assertEqual(result.diagnostics['ownership'][3, 3, 1], 1)
+
+    def test_explicit_removal_for_preedited_holes_does_not_treat_all_invalid_depth_as_removed(self):
+        fixture = self.fixture()
+        composite = fixture[1]
+        composite.set_selection('object', [])
+        composite.sources['room'].input_mask[..., 0, 0] = False
+        composite.sources['room'].input_labels[..., 0, 0] = -1
+        mask = np.zeros((8, 8), bool); mask[0, 0] = True
+        before = self.build(fixture)
+        self.assertEqual(before.metadata['inpainting']['method'], 'none')
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'lama.pt'; checkpoint(path)
+            with patch.dict(os.environ, GEN3C_LAMA_MODEL=str(path), GEN3C_LAMA_CACHE=temporary):
+                result = self.build(fixture, removal_mask=mask)
+        self.assertTrue(result.diagnostics['synthesized'][0, 0])
+        self.assertEqual(result.metadata['inpainting']['removed_instance_ids'], [])
+        with self.assertRaisesRegex(ValueError, 'overlaps retained geometry'):
+            self.build(fixture, removal_mask=np.ones((8, 8), bool))
+        with self.assertRaisesRegex(ValueError, 'source dimensions'):
+            self.build(fixture, removal_mask=np.zeros((4, 4), bool))
 
 
 if __name__ == '__main__':

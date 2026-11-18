@@ -8,10 +8,11 @@
 
 ## ToDos:
 - [P0] Integrate composite cache with GUI
-- [P1] Render objects in scenes with depth (objects in foreground should cover inserted object)
-- [P2] Fix object holes from sparse point clouds when object moves closer to camera
-    - Possible approaches: adaptive splatting, fill in holes with coverage mask
-- Integrate MoGe with composite pipeline
+- [P2] Integrate MoGe with composite pipeline
+- [P1] Fix incorrect depth estimation streaks
+- [P1] Find out how to condition seed image for object removal pipeline
+- [P1] How to dynamically occlude based on added object in scenes so that objects do not just become flat
+- [P2] Integrate for multiview and video inputs
 
 ## Inputs and outputs
 

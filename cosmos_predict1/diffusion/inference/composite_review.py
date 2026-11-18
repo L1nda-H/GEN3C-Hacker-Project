@@ -54,7 +54,8 @@ def save_seed_result(directory, result):
     metadata_path = directory / 'seed_metadata.json'
     metadata_path.write_text(json.dumps(result.metadata, indent=2, allow_nan=False) + '\n')
     np.savez_compressed(directory / 'seed_diagnostics.npz', **result.diagnostics)
-    for name in ('observed', 'synthesized', 'uncertainty', 'environment_depth_valid'):
+    for name in ('observed', 'synthesized', 'background_synthesized', 'environment_removal',
+                 'uncertainty', 'environment_depth_valid'):
         if name in result.diagnostics:
             cv2.imwrite(str(directory / f'seed_{name}.png'),
                         result.diagnostics[name].astype(np.uint8) * 255)

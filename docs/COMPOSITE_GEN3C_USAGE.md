@@ -101,12 +101,10 @@ output = Gen3cCompositePipeline(diffusion_pipeline).generate(
 # output is (uint8_video_THWC, final_prompt), or None if a guardrail blocks a chunk.
 ```
 
-With the default rendered seed, the first camera must cover at least half of the output pixels.
-`--min_seed_coverage` adjusts that threshold. Insufficient coverage saves the
-seed and previews, then raises an error so the scene author can choose a better
-starting camera; camera order is never changed automatically. Seed holes use
-the renderer's black fill (-1). The seed latent path has no coverage mask, so
-inspect hole artifacts during real inference. Warp conditioning does carry
+The first seed is always built from source RGB using the image-space compositor.
+There is no seed-strategy flag or rendered/provided fallback. The first camera
+must match the environment source pose and remain within its image field of
+view. Seed RGB has no spatial coverage mask; warp conditioning does carry
 binary coverage. All selected sources share one joint depth test, with each
 winning surface routed into its source buffer. Selected objects from the same
 source share that buffer. Buffers are ordered by sorted source ID, recorded as
@@ -127,9 +125,10 @@ the paper's feature max pooling.
 
 `render_cache()` and `render_diagnostics()` return combined scene renders;
 `render_conditioning()` routes the same joint winners into separate source
-buffers. The default rendered seed and preview joint images are recombined from visible
-buffers without another projection. Recombination sums covered RGB only and
-fills uncovered pixels with -1. Rendering does not fill gaps between points.
+buffers. Geometric preview joint images are recombined from visible buffers without
+another projection; holes in those diagnostic images remain -1. The initial
+image seed is constructed independently from source RGB, never from these
+buffers. Rendering does not fill gaps between points.
 
 Chunks overlap by one frame. Each continuation uses the preceding generated
 frame as its seed. Source caches remain static and generated-frame cache
@@ -203,13 +202,13 @@ before the next chunk.
 Other ranks omit review-only buffers, hashes, and files. Source provenance comes
 from the already validated label records. Preview tools retain full diagnostics.
 
-## Image-space and supplied seeds
+## Image-space seed
 
-`--seed_strategy rendered` retains the existing default. To construct the first
-seed directly from source RGB, use `--seed_strategy image_space`. Warp RGB and
+Composite generation always constructs its first seed directly from source RGB.
+The former `--seed_strategy`, `--seed_image`, and `--min_seed_coverage` arguments
+have been removed from both the CLI and Python generation API. Warp RGB and
 coverage masks are unchanged; continuation chunks still use the last generated
-frame. This is a seed-only experiment and cannot prevent artifacts from damaged
-warp conditioning.
+frame. A clean seed cannot prevent all artifacts from damaged warp conditioning.
 
 Preview the seed on CPU before loading diffusion weights:
 
@@ -223,8 +222,11 @@ The first camera must match the environment's source pose, and its field of
 view must lie within the source image. RGB is sampled directly with bilinear
 interpolation and edge extension within source pixel cells. Preserve pixel
 centers when resizing intrinsics: scale each row, then add `(scale - 1) / 2`
-to that row's principal point. Removed/unresolved valid environment content or
-moved environment objects require a supplied seed or the rendered strategy.
+to that row's principal point. Deselected positive-ID environment objects are
+automatically filled using CPU LaMa before compositing; see
+[LaMa setup and exact commands](LAMA_SEED_SETUP.md). This uses a TorchScript
+checkpoint with existing dependencies, not the original LaMa training package.
+Unresolved valid labels and moved environment objects still raise an error.
 
 Each selected imported object becomes a textured source-camera plane at its
 median valid depth, transformed by its existing scene placement. This avoids
@@ -241,35 +243,37 @@ prefer sorted source ID then instance ID; environment ties use the renderer's
 absolute depth tolerance and source ordering.
 
 By default, overlaps with missing depth or local depth boundaries raise an
-error before diffusion weights load. Inspect the scene/depth, supply a corrected
-seed, or explicitly use `--seed_occlusion_policy allow` (preview:
+error before diffusion weights load. Correct the scene/depth or explicitly use `--seed_occlusion_policy allow` (preview:
 `--seed-occlusion-policy allow`). This draws objects over missing environment
 depth and uses the available depth at uncertain boundaries; the uncertain
 regions are saved, not treated as reliable geometry.
 
-For a manually prepared seed use `--seed_strategy provided --seed_image seed.png`.
-It must be an RGB image at exactly the scene output dimensions, with no alpha
-channel; no automatic resizing occurs. Its SHA256 is recorded. Preview supports
-`--seed-strategy provided --seed-image seed.png`.
-
-Python callers use `seed_strategy`, `seed_image`, `seed_plane_depths` (a dict),
-and `seed_occlusion_policy` arguments on `generate()`. The default seed coverage
-threshold still applies to rendered seeds. Alternative seeds have complete RGB;
+Python callers can adjust `seed_plane_depths` (a dict) and
+`seed_occlusion_policy` on `generate()`. The seed has complete RGB;
 this does not imply complete or trustworthy 3D geometry.
 
-Additional review files for alternative seeds:
+Generation always saves:
 
-- `rendered_seed/seed.png` and `.npy`: the original adaptive seed for comparison.
-- `seed_metadata.json`: strategy, plane depths and projected bounds, explicit
-  uncertainty policy, and source ownership index ordering (or supplied image hash).
+- `seed_metadata.json`: fixed image-space construction, plane depths and projected
+  bounds, explicit uncertainty policy, source fingerprints and ownership ordering.
 - `seed_diagnostics.npz`: ownership `(source index, canonical object ID)`, proxy
   depth (zero for background), uncertainty, observed/synthesized RGB masks, and
   environment depth validity for image-space seeds. Antialiased pixels may mix
   multiple layers; ownership identifies the nearest contributing layer.
 - `seed_uncertainty.png` and other diagnostic masks: white marks true pixels.
   Observed means RGB sampled from sources, not measured target-view geometry;
-  this version synthesizes no missing RGB through inpainting.
+  `seed_synthesized.png` identifies RGB still contributed by LaMa, while
+  `seed_background_synthesized.png` shows the repair before foreground objects
+  are pasted. Filled backgrounds are excluded from seed occlusion depth tests.
+  LaMa RGB is never added as measured geometry to source caches.
 
-The CPU preview writes these seed files and a resolved scene, and optionally
-`rendered_seed/`. Full generation also records seed metadata and
-`rendered_seed_coverage` in `generation.json`.
+The CPU preview writes these seed files and a resolved scene. Its optional
+`--compare-rendered` writes `cache_render_reference/` for visual inspection only;
+that reference can never be selected as a generation seed. Full generation
+records seed metadata and `initial_warp_coverage` in `generation.json`. Warp
+coverage is diagnostic and never determines whether seed pixels are black.
+
+LaMa runs only when removal is requested, preserves unmasked source pixels, and
+caches the repaired background for reuse. It needs no GPU or package installs.
+See [setup](LAMA_SEED_SETUP.md) for weights, masks, cache details, and the explicit
+`--seed_removal_mask` option for sources whose removal IDs were already discarded.

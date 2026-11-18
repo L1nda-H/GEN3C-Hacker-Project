@@ -19,9 +19,7 @@ def create_parser():
     for name in ('disable_prompt_upsampler', 'offload_prompt_upsampler', 'tokenizer_dir'):
         remove_argument(parser, name)
     parser.add_argument('--scene_spec', required=True, help='SceneSpec JSON')
-    parser.add_argument('--min_seed_coverage', type=float, default=0.5)
-    parser.add_argument('--seed_strategy', choices=('rendered', 'image_space', 'provided'), default='rendered')
-    parser.add_argument('--seed_image', help='Complete RGB image at output dimensions for provided strategy')
+    parser.add_argument('--seed_removal_mask', help='Optional source-resolution grayscale mask of already removed geometry')
     parser.add_argument('--seed_plane_depths', type=json.loads,
                         help='JSON object mapping source_id:instance_id to source-camera plane depth')
     parser.add_argument('--seed_occlusion_policy', choices=('reject', 'allow'), default='reject',
@@ -56,17 +54,14 @@ def demo(args, scene_spec=None):
     if (args.num_video_frames < 121 or (args.num_video_frames - 1) % 120
             or args.num_video_frames > scene.cameras()[0].shape[1]):
         raise ValueError('Trajectory must cover num_video_frames = 120*N+1, N >= 1')
-    if not 0 < args.min_seed_coverage <= 1:
-        raise ValueError('min_seed_coverage must be in (0,1]')
     prompts = _load_prompts(args)
     # Validate the seed before loading diffusion weights or initializing ranks.
-    from cosmos_predict1.diffusion.inference.composite_seed import prepare_initial_seed
-    strategy = getattr(args, 'seed_strategy', 'rendered')
-    if strategy != 'rendered' or getattr(args, 'seed_image', None) or getattr(args, 'seed_plane_depths', None):
-        prepare_initial_seed(scene, build_composite_scene(scene), strategy=strategy,
-                             provided_seed=getattr(args, 'seed_image', None),
-                             plane_depths=getattr(args, 'seed_plane_depths', None),
-                             occlusion_policy=getattr(args, 'seed_occlusion_policy', 'reject'))
+    from cosmos_predict1.diffusion.inference.composite_seed import build_image_space_seed
+    poses, intrinsics = scene.cameras()
+    build_image_space_seed(scene, build_composite_scene(scene), poses[0, 0], intrinsics[0, 0],
+                           plane_depths=getattr(args, 'seed_plane_depths', None),
+                           occlusion_policy=getattr(args, 'seed_occlusion_policy', 'reject'),
+                           removal_mask=getattr(args, 'seed_removal_mask', None))
     from cosmos_predict1.diffusion.inference.gen3c_pipeline import Gen3cPipeline
     from cosmos_predict1.utils import misc
     from cosmos_predict1.utils.model_config import model_config_session
@@ -139,11 +134,10 @@ def _save_generations(args, pipeline, scene, device, *, prompts=None):
         output = composite_pipeline.generate(
             scene, prompt=prompt, negative_prompt=args.negative_prompt, prepared_composite=composite,
             num_frames=args.num_video_frames, device=device, review_dir=review_dir,
-            generation_settings=settings, min_seed_coverage=getattr(args, 'min_seed_coverage', 0.5),
-            seed_strategy=getattr(args, 'seed_strategy', 'rendered'),
-            seed_image=getattr(args, 'seed_image', None),
+            generation_settings=settings,
             seed_plane_depths=getattr(args, 'seed_plane_depths', None),
             seed_occlusion_policy=getattr(args, 'seed_occlusion_policy', 'reject'),
+            seed_removal_mask=getattr(args, 'seed_removal_mask', None),
         )
         if output is None:
             log.critical('Guardrail blocked composite generation.')

@@ -241,13 +241,13 @@ python -m cosmos_predict1.diffusion.inference.gen3c_composite \
 ```
 
 Result: `outputs/gcp_composite/candle.mp4`. Inspect `candle_review/seed.png`,
-buffer previews, and `generation.json` alongside the video. If seed coverage
-fails, inspect those artifacts and fix the scene. If CUDA runs out of memory
+buffer previews, and `generation.json` alongside the video. If seed validation
+fails, fix the source camera, field of view, or reported depth uncertainty. If CUDA runs out of memory
 with these offload flags, use a GPU with more VRAM; successful `nvidia-smi`
 alone does not establish sufficient memory.
 
-To compare a seed stitched from source RGB against the adaptive rendered seed,
-first preview it at output resolution (using the pixel-center intrinsics
+The initial seed is always stitched from source RGB. To compare it against the
+adaptive cache render (a diagnostic reference only), preview it at output resolution (using the pixel-center intrinsics
 conversion in step 5):
 
 ```bash
@@ -256,15 +256,21 @@ OMP_NUM_THREADS=4 python -m scripts.preview_composite_seed \
   --output-dir outputs/candle_seed_preview --compare-rendered
 ```
 
-Inspect `seed.png` and the comparison in `rendered_seed/`. If uncertain
+Inspect `seed.png` and the comparison in `cache_render_reference/`. If uncertain
 occlusion is reported, inspect the depth or rerun with
 `--seed-occlusion-policy allow` to save a preview with flagged regions in
 `seed_uncertainty.png`. This explicitly accepts uncertain depth decisions.
-Then add `--seed_strategy image_space` to the inference command (and
-`--seed_occlusion_policy allow` only if that policy was inspected and chosen).
-Use a new output name/directory for the comparison. The warp buffers stay the
-same, so this isolates the seed change. Nonplanar objects may need placement
+No seed-selection flag is needed for inference. Add
+`--seed_occlusion_policy allow` only if that policy was inspected and chosen.
+Use a new output name/directory for each experiment. Warp buffers retain the
+same rendering path. Nonplanar objects may need placement
 adjustment when represented as textured planes.
 
 More options: [composite usage](COMPOSITE_GEN3C_USAGE.md) and
 [segmentation/placement examples](REAL_CACHE_MVP_EVALUATION.md).
+
+For scenes that remove existing environment objects, set up the CPU LaMa
+TorchScript checkpoint using [these local setup commands](LAMA_SEED_SETUP.md).
+The seed builder fills deselected objects automatically; the candle insertion
+example above does not need LaMa unless it also removes an environment object.
+On a GPU VM, LaMa still runs on CPU and caches the fill before GEN3C loads.

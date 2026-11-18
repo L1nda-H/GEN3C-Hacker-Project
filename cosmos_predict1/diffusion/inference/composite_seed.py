@@ -8,7 +8,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from PIL import Image
+
+from cosmos_predict1.diffusion.inference.lama_inpainting import inpaint_background
 
 
 @dataclass
@@ -21,35 +22,6 @@ class SeedResult:
 def _result(rgb, diagnostics, metadata):
     seed = torch.from_numpy(np.ascontiguousarray(rgb.transpose(2, 0, 1))).float()[None, :, None]
     return SeedResult(seed, diagnostics, metadata)
-
-
-def load_provided_seed(path, image_size):
-    """An explicit, complete RGB override; never resize or infer an alpha matte."""
-    from cosmos_predict1.diffusion.inference.instance_segmentation import file_sha256
-    path = Path(path)
-    with Image.open(path) as image:
-        if image.mode != 'RGB' or image.size != tuple(reversed(image_size)):
-            raise ValueError('Provided seed must be RGB with exactly the scene output dimensions')
-        rgb = np.asarray(image).astype(np.float32) / 127.5 - 1
-    return _result(rgb, {}, dict(strategy='provided', path=str(path.resolve()),
-                                sha256=file_sha256(path), completeness=1., geometry_confidence=None))
-
-
-def prepare_initial_seed(scene, composite, *, strategy='rendered', provided_seed=None,
-                         plane_depths=None, occlusion_policy='reject'):
-    if strategy not in ('rendered', 'image_space', 'provided'):
-        raise ValueError('Unknown seed strategy')
-    if (provided_seed is not None) != (strategy == 'provided'):
-        raise ValueError('A seed image is required only for provided seed strategy')
-    if plane_depths and strategy != 'image_space':
-        raise ValueError('Plane-depth overrides require image_space seed strategy')
-    if strategy == 'provided':
-        return load_provided_seed(provided_seed, scene.image_size)
-    if strategy == 'image_space':
-        poses, intrinsics = scene.cameras()
-        return build_image_space_seed(scene, composite, poses[0, 0], intrinsics[0, 0],
-                                      plane_depths=plane_depths, occlusion_policy=occlusion_policy)
-    return None
 
 
 def _array(tensor):
@@ -74,7 +46,8 @@ def _sample(image, xy, *, nearest=False, border=cv2.BORDER_CONSTANT):
 
 @torch.no_grad()
 def build_image_space_seed(scene, composite, first_w2c, first_intrinsics, *,
-                           plane_depths=None, occlusion_policy='reject', boundary_threshold=.05):
+                           plane_depths=None, occlusion_policy='reject', boundary_threshold=.05,
+                           removal_mask=None):
     """Paste calibrated textured planes over a same-camera environment RGB image.
 
     plane_depths maps 'source_id:canonical_id' to source-camera Z. Unknown overlap
@@ -99,11 +72,28 @@ def build_image_space_seed(scene, composite, first_w2c, first_intrinsics, *,
     env_pose, env_k = map(_array, composite._source_cameras[env_id])
     if not np.allclose(pose, env_pose, atol=1e-6, rtol=0):
         raise ValueError('Image-space seed requires the first camera to match the environment source pose; '
-                         'choose rendered or provided seed for a different starting view')
+                         'start the trajectory at the environment source camera')
     labels = env.input_labels.reshape(env.input_image.shape[-2:]).numpy()
     valid = env.input_mask.reshape(labels.shape).bool().numpy()
-    if np.any(valid & ~np.isin(labels, list(composite.selections[env_id]))):
-        raise ValueError('Image-space seed cannot restore removed or unresolved environment content')
+    if np.any(valid & (labels < 0)):
+        raise ValueError('Image-space seed requires resolved environment labels before inpainting')
+    removed = (labels > 0) & ~np.isin(labels, list(composite.selections[env_id]))
+    if removal_mask is not None:
+        # Pre-edited sources may already have discarded object IDs. Never infer
+        # a removal from missing depth alone: those RGB pixels can still be valid.
+        if isinstance(removal_mask, (str, Path)):
+            from PIL import Image
+            with Image.open(removal_mask) as image:
+                if image.mode not in ('1', 'L') or image.size != tuple(reversed(labels.shape)):
+                    raise ValueError('Seed removal mask must be a grayscale PNG at environment source dimensions')
+                explicit = np.asarray(image) > 0
+        else:
+            explicit = np.asarray(removal_mask, dtype=bool)
+        if explicit.shape != labels.shape:
+            raise ValueError('Seed removal mask must match the environment source dimensions')
+        if np.any(explicit & valid & np.isin(labels, list(composite.selections[env_id]))):
+            raise ValueError('Seed removal mask overlaps retained geometry; deselect the object in the scene first')
+        removed |= explicit
     for (sid, _), transform in composite.object_transforms.items():
         if sid == env_id and not torch.allclose(transform, torch.eye(4, dtype=transform.dtype)):
             raise ValueError('Image-space seed does not support moved environment objects')
@@ -113,16 +103,27 @@ def build_image_space_seed(scene, composite, first_w2c, first_intrinsics, *,
               | (xy[..., 1] < -.5001) | (xy[..., 1] > eh - .4999)):
         raise ValueError('Image-space seed target field of view extends beyond environment RGB')
     background = _array(env.input_image[0, 0, 0, 0]).transpose(1, 2, 0).astype(np.float32)
+    # Cover boundary contamination, while protecting other selected objects.
+    fill_mask = cv2.dilate(removed.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+    fill_mask &= ~((labels > 0) & np.isin(labels, list(composite.selections[env_id])))
+    background, inpainting = inpaint_background(background, fill_mask)
+    inpainting.update(mask_dilation_source_pixels=2, removed_pixels=int(removed.sum()),
+                      removed_instance_ids=sorted(int(i) for i in np.unique(labels[removed]) if i > 0),
+                      explicit_removal_mask=removal_mask is not None)
     canvas = _sample(background, xy, border=cv2.BORDER_REPLICATE)
+    # Any interpolation contribution from synthesized RGB is unobserved geometry.
+    background_synthesized = _sample(fill_mask, xy, border=cv2.BORDER_REPLICATE) > 0
+    synthesized = background_synthesized.copy()
     points = _array(env.input_points).reshape(eh, ew, 3)
     env_z = points @ env_pose[2, :3] + env_pose[2, 3]
     z = _sample(env_z, xy, nearest=True, border=cv2.BORDER_REPLICATE)
-    depth_valid = _sample(valid, xy, nearest=True, border=cv2.BORDER_REPLICATE) > .5
-    safe = np.where(valid, env_z, 0).astype(np.float32)
+    geometry_valid = valid & ~fill_mask
+    depth_valid = (_sample(geometry_valid, xy, nearest=True, border=cv2.BORDER_REPLICATE) > .5) & ~background_synthesized
+    safe = np.where(geometry_valid, env_z, 0).astype(np.float32)
     high = cv2.dilate(safe, np.ones((3, 3), np.uint8))
     low = cv2.erode(safe, np.ones((3, 3), np.uint8))
-    uncertain_source = ~valid | ((high - low) > boundary_threshold * np.maximum(low, 1e-8))
-    uncertain_depth = _sample(uncertain_source, xy, nearest=True, border=cv2.BORDER_REPLICATE) > .5
+    uncertain_source = ~geometry_valid | ((high - low) > boundary_threshold * np.maximum(low, 1e-8))
+    uncertain_depth = (_sample(uncertain_source, xy, nearest=True, border=cv2.BORDER_REPLICATE) > .5) | background_synthesized
     rays = pixels @ np.linalg.inv(k).T
     layers, records = [], []
     source_ids = sorted(composite.sources)
@@ -173,7 +174,7 @@ def build_image_space_seed(scene, composite, first_w2c, first_intrinsics, *,
             uncertainty = support & uncertain_depth
             if uncertainty.any() and occlusion_policy == 'reject':
                 raise ValueError(f'Uncertain environment occlusion for {key} at {int(uncertainty.sum())} pixels; '
-                                 'inspect depth or explicitly choose allow/provided seed')
+                                 'inspect depth or explicitly choose the allow occlusion policy')
             closer = (proxy_z < z - composite.depth_tolerance)
             tied = np.abs(proxy_z - z) <= composite.depth_tolerance
             visible = support & (~depth_valid | closer | (tied & (sid < env_id)))
@@ -192,6 +193,7 @@ def build_image_space_seed(scene, composite, first_w2c, first_intrinsics, *,
     label_x = np.clip(np.floor(xy[..., 0]+.5).astype(np.int64), 0, ew-1)
     label_y = np.clip(np.floor(xy[..., 1]+.5).astype(np.int64), 0, eh-1)
     ownership[..., 1] = labels[label_y, label_x]
+    ownership[background_synthesized, 1] = -1  # synthesized background has no measured object ID
     uncertainty = np.zeros(scene.image_size, bool)
     proxy_depth = np.zeros(scene.image_size, np.float32)
     if layers:
@@ -204,17 +206,21 @@ def build_image_space_seed(scene, composite, first_w2c, first_intrinsics, *,
                 a = np.where(selected, alpha, 0)
                 canvas = color * selected[..., None] + canvas * (1-a[..., None])
                 covered = a > 1e-6
+                synthesized &= a < 1 - 1e-6  # opaque observed foreground replaces synthesized background
                 ownership[covered] = [source_index, instance]
                 proxy_depth[covered] = layer_z[covered]
                 uncertainty |= unknown
     diagnostics = dict(ownership=ownership, proxy_depth=proxy_depth, uncertainty=uncertainty,
-                       observed=np.ones(scene.image_size, bool), synthesized=np.zeros(scene.image_size, bool),
+                       observed=~synthesized, synthesized=synthesized,
+                       background_synthesized=background_synthesized,
+                       environment_removal=_sample(removed, xy, nearest=True, border=cv2.BORDER_REPLICATE) > .5,
                        environment_depth_valid=depth_valid)
     return _result(np.clip(canvas, -1, 1), diagnostics,
                    dict(strategy='image_space', completeness=1., geometry_confidence=None,
                         environment_pose_matches=True, environment_fov_covered=True,
                         source_ids=source_ids,
                         source_fingerprints={sid: composite.sources[sid].source_fingerprint for sid in source_ids},
-                        planes=records, occlusion_policy=occlusion_policy,
+                        planes=records, occlusion_policy=occlusion_policy, inpainting=inpainting,
+                        synthesized_pixels=int(synthesized.sum()),
                         boundary_threshold=boundary_threshold, uncertain_pixels=int(uncertainty.sum()),
-                        observed_definition='RGB sampled from source images; not measured target-view geometry'))
+                        observed_definition='RGB has no LaMa contribution; not measured target-view geometry'))

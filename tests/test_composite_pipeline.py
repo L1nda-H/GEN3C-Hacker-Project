@@ -32,20 +32,34 @@ from cosmos_predict1.diffusion.inference.instance_segmentation import (
 
 
 class CompositePipelineTests(unittest.TestCase):
-    def test_provided_seed_is_used_and_invalid_image_space_seed_fails_before_diffusion(self):
-        from PIL import Image
-        image = self.root / 'provided.png'
-        Image.new('RGB', (self.w, self.h), 'white').save(image)
-        self.generate(seed_strategy='provided', seed_image=image)
-        seed = self.diffusion.generate.call_args_list[0].kwargs['image_path']
-        torch.testing.assert_close(seed, torch.ones_like(seed))
-        manifest = json.loads((self.review / 'generation.json').read_text())
-        self.assertEqual(len(manifest['seed_metadata']['sha256']), 64)
-        self.diffusion.generate.reset_mock()
+    def test_lama_removal_reaches_diffusion_seed_but_not_warp_cache(self):
+        import os
+        from tests.test_lama_inpainting import checkpoint
+        original = self.prepared['room']
+        obs = original.observations[self.key]
+        mask = torch.zeros(self.h, self.w, dtype=torch.bool); mask[0, -1] = True
+        segmented = SegmentedSource(original, {self.key: _segmented_observation(
+            self.key, obs, [InstanceProposal(mask, None, 1)], torch.ones_like(mask))})
+        labeled = label_source(segmented, source_id='room')
+        save_labeled_source(self.root / 'room_labels', labeled)
+        composite = build_composite_scene(self.scene)
+        points = composite.sources['room'].input_points.clone()
+        model = self.root / 'lama.pt'; checkpoint(model)
+        with patch.dict(os.environ, GEN3C_LAMA_MODEL=str(model), GEN3C_LAMA_CACHE=str(self.root / 'cache')):
+            self.generate(prepared_composite=composite, seed_occlusion_policy='allow')
+        first = self.diffusion.generate.call_args_list[0].kwargs
+        torch.testing.assert_close(first['image_path'][0, :, 0, 0, -1], torch.full((3,), -.5))
+        self.assertEqual(float(first['rendered_warp_masks'][0, 0, :, 0, 0, -1].sum()), 0.)
+        torch.testing.assert_close(points, composite.sources['room'].input_points)
+        metadata = json.loads((self.review / 'generation.json').read_text())['seed_metadata']
+        self.assertEqual(metadata['inpainting']['method'], 'lama_torchscript')
+        self.assertTrue((self.review / 'seed_synthesized.png').exists())
+
+    def test_invalid_image_space_seed_fails_before_diffusion(self):
         scene = deepcopy(self.scene)
         scene.target_w2cs[0, 0, 0, 3] = .1
         with self.assertRaisesRegex(ValueError, 'first camera'):
-            self.generate(scene, seed_strategy='image_space')
+            self.generate(scene)
         self.diffusion.generate.assert_not_called()
         self.assertEqual(json.loads((self.review / 'generation.json').read_text())['status'], 'failed')
 
@@ -61,25 +75,21 @@ class CompositePipelineTests(unittest.TestCase):
                 buffers['depth'][..., 0, -1] = 0
             return buffers
 
+        expected = cracked(*self.scene.cameras(), include_depth=True)
         with patch.object(composite, 'render_conditioning', side_effect=cracked):
             self.generate(prepared_composite=composite)
-            original = [call.kwargs for call in self.diffusion.generate.call_args_list]
-            self.diffusion.generate.reset_mock()
-            self.diffusion.generate.side_effect = [(v, 'final prompt') for v in self.segments]
-            self.generate(prepared_composite=composite, seed_strategy='image_space')
-        changed = [call.kwargs for call in self.diffusion.generate.call_args_list]
-        for a, b in zip(original, changed):
-            torch.testing.assert_close(a['rendered_warp_images'], b['rendered_warp_images'])
-            torch.testing.assert_close(a['rendered_warp_masks'], b['rendered_warp_masks'])
-        torch.testing.assert_close(original[0]['image_path'][0, :, 0, 0, -1], torch.full((3,), -1.))
-        torch.testing.assert_close(changed[0]['image_path'][0, :, 0, 0, -1], torch.tensor([-1., -1., 1.]))
-        torch.testing.assert_close(original[1]['image_path'], changed[1]['image_path'])
+        first, second = [call.kwargs for call in self.diffusion.generate.call_args_list]
+        torch.testing.assert_close(first['rendered_warp_images'], expected['rgb'][:, :3])
+        torch.testing.assert_close(first['rendered_warp_masks'], expected['coverage'][:, :3])
+        torch.testing.assert_close(first['rendered_warp_images'][0, 0, :, :, 0, -1], torch.full((2, 3), -1.))
+        torch.testing.assert_close(first['image_path'][0, :, 0, 0, -1], torch.tensor([-1., -1., 1.]))
+        torch.testing.assert_close(second['image_path'], torch.full((1, 3, 1, self.h, self.w), 64 / 127.5 - 1))
         manifest = json.loads((self.review / 'generation.json').read_text())
         self.assertEqual(manifest['seed_strategy'], 'image_space')
         self.assertEqual(manifest['seed_coverage'], 1.)
-        self.assertLess(manifest['rendered_seed_coverage'], 1.)
+        self.assertLess(manifest['initial_warp_coverage'], 1.)
         self.assertTrue((self.review / 'seed_diagnostics.npz').exists())
-        self.assertTrue((self.review / 'rendered_seed/seed.png').exists())
+        self.assertFalse((self.review / 'rendered_seed').exists())
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -287,7 +297,8 @@ class CompositePipelineTests(unittest.TestCase):
         args = parser.parse_args(['--scene_spec', 'unused', '--prompt', 'red object',
                                   '--height', str(self.h), '--width', str(self.w)])
         for name in ('prompt_upsampler_dir', 'disable_prompt_upsampler', 'offload_prompt_upsampler', 'tokenizer_dir',
-                     'rasterization', 'candidate_batch_size', 'support_depth_tolerance'):
+                     'rasterization', 'candidate_batch_size', 'support_depth_tolerance',
+                     'seed_strategy', 'seed_image', 'min_seed_coverage'):
             self.assertFalse(hasattr(args, name))
             self.assertNotIn('--' + name, parser.format_help())
         args.scene_spec = None
@@ -305,18 +316,13 @@ class CompositePipelineTests(unittest.TestCase):
         self.assertIs(factory.call_args.kwargs['enable_prompt_upsampler'], False)
         self.assertNotIn('prompt_upsampler_dir', factory.call_args.kwargs)
 
-    def test_deterministic_holes_and_low_coverage_failure(self):
+    def test_camera_outside_environment_view_fails_without_black_fallback(self):
         scene = deepcopy(self.scene)
-        # Shift the camera one pixel right: the rightmost column becomes a hole.
-        scene.target_w2cs[:, :, 0, 3] = -2
-        self.generate(scene, min_seed_coverage=0.1)
-        seed = self.diffusion.generate.call_args_list[0].kwargs['image_path']
-        torch.testing.assert_close(seed[..., -1], -torch.ones_like(seed[..., -1]))
-        self.diffusion.generate.reset_mock()
-        with self.assertRaisesRegex(ValueError, 'coverage'):
-            self.generate(scene, min_seed_coverage=1)
+        scene.target_intrinsics[..., 0, 2] += 3
+        with self.assertRaisesRegex(ValueError, 'field of view'):
+            self.generate(scene)
         self.diffusion.generate.assert_not_called()
-        self.assertTrue((self.review / 'seed.npy').is_file())
+        self.assertFalse((self.review / 'seed.npy').exists())
         self.assertEqual(json.loads((self.review / 'generation.json').read_text())['status'], 'failed')
 
     def test_guardrail_failure_on_continuation_stops_generation(self):
@@ -366,11 +372,10 @@ class CompositePipelineTests(unittest.TestCase):
         self.generate()
         first = self.diffusion.generate.call_args_list[0].kwargs
         self.assertEqual(first['rendered_warp_images'].shape[2], 2)
-        from cosmos_predict1.diffusion.inference.cache3d_composite import combine_visible_buffers
-        rgb, coverage = combine_visible_buffers(first['rendered_warp_images'][:, :1],
-                                                first['rendered_warp_masks'][:, :1])
-        torch.testing.assert_close(first['image_path'], rgb[:, 0, 0].unsqueeze(2))
-        self.assertTrue((coverage == 1).all())
+        from cosmos_predict1.diffusion.inference.composite_seed import build_image_space_seed
+        poses, intrinsics = self.scene.cameras()
+        expected = build_image_space_seed(self.scene, build_composite_scene(self.scene), poses[0, 0], intrinsics[0, 0])
+        torch.testing.assert_close(first['image_path'], expected.rgb)
         manifest = json.loads((self.review / 'generation.json').read_text())
         self.assertEqual(manifest['renderer']['candidate_batch_size'], 262144)
         self.assertEqual(manifest['renderer']['support_depth_tolerance'], .05)
