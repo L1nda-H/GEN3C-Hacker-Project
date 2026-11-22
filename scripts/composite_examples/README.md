@@ -6,7 +6,7 @@ Activate the configured GPU environment from
 ```bash
 conda activate cosmos-predict1
 python scripts/composite_examples/run_duck.py --output-dir outputs/duck_example
-python scripts/composite_examples/run_cat.py --output-dir outputs/cat_example
+SEED_OCCLUSION_POLICY=allow python scripts/composite_examples/run_cat.py --output-dir outputs/cat_example
 python scripts/composite_examples/run_creature.py --output-dir outputs/creature_example
 ```
 
