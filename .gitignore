@@ -20,7 +20,6 @@ checkpoints/*
 datasets/*
 !datasets/README.md
 apex/
-apex-gen3c/
 
 # Data types
 *.jit
@@ -38,7 +37,6 @@ apex-gen3c/
 *.bin
 *.pickle
 *.txt
-!requirements-cpu.txt
 
 # Other uncheckable file types
 *.zip

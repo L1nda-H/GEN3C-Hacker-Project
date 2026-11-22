@@ -178,6 +178,9 @@ def remove_argument(parser, arg_name):
     for action in actions_to_remove:
         # Remove action from parser._actions
         parser._actions.remove(action)
+        for group in parser._action_groups:
+            if action in group._group_actions:
+                group._group_actions.remove(action)
 
         # Remove option strings
         for option_string in action.option_strings:

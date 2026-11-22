@@ -16,6 +16,7 @@ from cosmos_predict1.utils import log, misc
 from cosmos_predict1.utils.distributed import device_with_rank, is_rank0, get_rank
 from cosmos_predict1.utils.io import save_video
 from cosmos_predict1.diffusion.inference.cache_3d import Cache3D_Buffer, Cache4D
+from cosmos_predict1.diffusion.inference.instance_labeling import load_cache_label_kwargs
 import torch.nn.functional as F
 
 
@@ -142,9 +143,12 @@ class Gen3cPersistentModel():
                                focal_lengths_np: np.ndarray,
                                principal_point_rel_np: np.ndarray,
                                resolutions: np.ndarray,
-                               masks_np: np.ndarray | None = None):
+                               masks_np: np.ndarray | None = None,
+                               *, labels_path=None, observation_keys=None, preparation=None, selected_ids=None):
         import torchvision.transforms.functional as transforms_F
 
+        if selected_ids is not None and labels_path is None:
+            raise ValueError("Object selection requires labels_path")
         # Check inputs
         n = images_np.shape[0]
         assert images_np.shape[-1] == 3
@@ -180,13 +184,14 @@ class Gen3cPersistentModel():
 
             # TODO: MoGE provides camera params, is it okay to just ignore the user-provided ones?
             input_image = moge_image_b1chw_float[:, 0].clone()
-            self.cache = Cache3D_Buffer(
+            cache_type = Cache3D_Buffer
+            cache_kwargs = dict(
                 frame_buffer_max=self.frame_buffer_max,
                 generator=self.generator,
                 noise_aug_strength=self.args.noise_aug_strength,
                 input_image=input_image,                     # [B, C, H, W]
                 input_depth=moge_depth_b11hw[:, 0],          # [B, 1, H, W]
-                # input_mask=moge_mask_b11hw[:, 0],          # [B, 1, H, W]
+                input_mask=moge_mask_b11hw[:, 0],            # [B, 1, H, W]
                 input_w2c=moge_initial_w2c_b144[:, 0],       # [B, 4, 4]
                 input_intrinsics=moge_intrinsics_b133[:, 0], # [B, 3, 3]
                 filter_points_threshold=self.args.filter_points_threshold,
@@ -230,7 +235,8 @@ class Gen3cPersistentModel():
             intrinsics_b33_np[:, 2, 2] = 1.0
             intrinsics_b33 = torch.from_numpy(intrinsics_b33_np).to(self.device_with_rank)
 
-            self.cache = Cache4D(
+            cache_type = Cache4D
+            cache_kwargs = dict(
                 input_image=image_bchw_float.clone(), # [B, C, H, W]
                 input_depth=depth_b1hw,               # [B, 1, H, W]
                 input_mask=mask_b1hw,                 # [B, 1, H, W]
@@ -246,6 +252,13 @@ class Gen3cPersistentModel():
             estimated_w2c_b44_np = world_to_cameras_np
             estimated_focal_lengths_b2_np = focal_lengths_np
             estimated_principal_point_rel_b2_np = principal_point_rel_np
+
+        if labels_path is not None:
+            cache_kwargs.update(load_cache_label_kwargs(
+                labels_path, cache_kwargs, observation_keys=observation_keys, preparation=preparation,
+            ))
+        self.cache = cache_type(**cache_kwargs)
+        self.selected_ids = None if selected_ids is None else tuple(selected_ids)
 
         # Resize seeding image to match the desired resolution.
         if (seeding_image.shape[2] != self.H) or (seeding_image.shape[3] != self.W):
@@ -309,6 +322,7 @@ class Gen3cPersistentModel():
             view_cameras_w2cs[:, 0:self.sample_n_frames],
             view_camera_intrinsics[:, 0:self.sample_n_frames],
             start_frame_idx=0,
+            selected_ids=self.selected_ids,
         )
 
         all_rendered_warps = []
@@ -352,7 +366,9 @@ class Gen3cPersistentModel():
 
         # We predict depth either if we need it (multi-round generation without depth in the cache),
         # or if the user requested it explicitly.
-        need_depth_of_latest_frame = return_estimated_depths or (num_ar_iterations > 1 and not cache_is_multiframe)
+        need_depth_of_latest_frame = return_estimated_depths or (
+            num_ar_iterations > 1 and not cache_is_multiframe and self.cache.input_labels is None
+        )
         if need_depth_of_latest_frame:
             pred_depth, _, pred_image_for_depth_chw_0_1 = depth_for_frame(video[-1])
 
@@ -374,14 +390,13 @@ class Gen3cPersistentModel():
             end_frame_idx = start_frame_idx + self.sample_n_frames
             log.info(f"Generating frames {start_frame_idx} - {end_frame_idx} (out of {n_frames_total} total)...")
 
-            if cache_is_multiframe:
-                # Nothing much to do, we assume that depth is alraedy provided and
-                # all frames of the seeding video are already in the cache.
+            if cache_is_multiframe or self.cache.input_labels is not None:
+                # Labeled sources retain their geometry until generated labels can be associated.
                 pred_image_for_depth_chw_0_1 = torch.tensor(
                     video[-1], device=self.device_with_rank
                 ).permute(2, 0, 1) / 255.0 # (C,H,W), range [0,1]
 
-            else:
+            elif self.cache.input_labels is None:
                 self.cache.update_cache(
                     new_image=pred_image_for_depth_chw_0_1.unsqueeze(0) * 2 - 1, # (B,C,H,W) range [-1,1]
                     new_depth=pred_depth, #  (1,1,H,W)
@@ -406,6 +421,7 @@ class Gen3cPersistentModel():
                 current_segment_w2cs,
                 current_segment_intrinsics,
                 start_frame_idx=cache_start_frame_idx,
+                selected_ids=self.selected_ids,
             )
 
             if save_buffer:
@@ -424,7 +440,9 @@ class Gen3cPersistentModel():
             video = np.concatenate([video, video_new[overlap_frames:]], axis=0)
 
             # Prepare depth prediction for the next AR iteration.
-            need_depth_of_latest_frame = return_estimated_depths or ((num_iter < num_ar_iterations - 1) and not cache_is_multiframe)
+            need_depth_of_latest_frame = return_estimated_depths or (
+                num_iter < num_ar_iterations - 1 and not cache_is_multiframe and self.cache.input_labels is None
+            )
             if need_depth_of_latest_frame:
                 # Either we don't have depth (e.g. single-image seeding), or the user requested
                 # depth to be returned explicitly.

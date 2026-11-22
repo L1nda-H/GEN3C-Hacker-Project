@@ -1,0 +1,279 @@
+# Static composite generation
+
+`Gen3cCompositePipeline` combines labeled sources and wraps the existing
+`Gen3cPipeline` for diffusion. `gen3c_composite.py` is its dedicated CLI.
+`gen3c_multiview.py` remains unchanged and handles observations of one scene.
+The current composite pipeline accepts one prepared image per source.
+
+## Prepare reproducible scene inputs
+
+Persist the **same PreparedSource used for labeling**, together with its
+`LabeledSource`. Do not reconstruct these from resized images, rerun depth
+estimation, or resize label maps. Existing label artifacts omit RGB/depth/cameras,
+so the prepared input must also be saved. Both paths refer to local files.
+
+```python
+from pathlib import Path
+import torch
+
+from cosmos_predict1.diffusion.inference.composite_scene import (
+    SceneSource, SceneSpec, save_prepared_source,
+)
+from cosmos_predict1.diffusion.inference.instance_labeling import save_labeled_source
+
+# room_labels and object_labels are validated LabeledSource results from the
+# existing labeling stage. ID 0 must be GUI/user-confirmed environment.
+# Object IDs below come from the source's registry, never SAM proposal indices.
+root = Path("datasets/composite_example").resolve()
+root.mkdir(parents=True, exist_ok=True)
+for name, labeled in [("room", room_labels), ("objects", object_labels)]:
+    save_prepared_source(root / f"{name}.npz", labeled.prepared_source)
+    save_labeled_source(root / f"{name}_labels", labeled)
+
+placement = torch.eye(4, dtype=torch.float64)
+placement[:3, 3] = torch.tensor([0.3, 0.0, 0.0])  # calibrate in room units
+scene = SceneSpec(
+    sources=[
+        SceneSource(room_labels.registry.source_id, root / "room.npz",
+                    root / "room_labels", room_labels.source_fingerprint, [0]),
+        SceneSource(object_labels.registry.source_id, root / "objects.npz",
+                    root / "objects_labels", object_labels.source_fingerprint,
+                    selected_ids=[1], source_transform=placement),
+    ],
+    environment_source=room_labels.registry.source_id,
+    target_w2cs=target_w2cs,              # [1,T,4,4], OpenCV world-to-camera
+    target_intrinsics=target_intrinsics,  # [1,T,3,3]
+    image_size=(704, 1280),               # exact diffusion output dimensions
+)
+scene.save(root / "scene.json")
+```
+
+Use distinct registry source IDs. The environment source must explicitly select
+0 and retain its identity source transform. All other selected IDs must be
+registered positive IDs; unknown/unassigned regions are excluded. Object
+transforms are optional `{positive_id: matrix}` mappings. Placement applies
+`T_source @ T_object @ p_source`, with orientation-preserving uniform scale,
+rotation and translation. Transforms never modify the child geometry.
+
+The prepared NPZ schema stores a JSON `metadata` scalar containing version 1,
+the original observation key, preparation settings, and exact source
+fingerprint. Its `rgb`, `depth`, `intrinsics`, `w2c`, and `geometry_mask` arrays
+preserve their original dtypes and values. Source and label fingerprints are
+checked before cache construction. This is separate from legacy VIPE exports.
+
+`SceneSpec.load("scene.json")` resolves artifact paths relative to that JSON
+file. `SceneSpec.save()` records absolute resolved paths. Direct Python models
+and loaded JSON share validation; call `scene.validate()` after GUI edits.
+
+## Generate
+
+On the configured CUDA inference machine, with the existing GEN3C dependencies
+and checkpoints installed:
+
+```bash
+python -m cosmos_predict1.diffusion.inference.gen3c_composite \
+  --scene_spec datasets/composite_example/scene.json \
+  --checkpoint_dir checkpoints \
+  --prompt "A red chair in a furnished room" \
+  --num_video_frames 241 --height 704 --width 1280 \
+  --video_save_folder outputs/composite --video_save_name chair
+```
+
+Use `120*N+1` frames, at least 121, with enough target cameras. The CLI shares
+the existing Hydra/model initialization and supported offloading options, without
+initializing SAM. Every prompt must be explicit and nonempty, including batch
+entries. Prompt upsampling is disabled; the composite CLI exposes no upsampler
+or unused tokenizer-directory flags. It accepts no
+legacy `--npz_path`, `--labels_path`, or `--selected_ids` flags; selections belong
+to the scene. It records the supplied `--checkpoint_revision`, or computes a
+SHA256 of the diffusion `model.pt` when omitted (this reads the entire file).
+
+For Python/GUI callers with an already initialized diffusion pipeline:
+
+```python
+from cosmos_predict1.diffusion.inference.gen3c_composite_pipeline import Gen3cCompositePipeline
+
+output = Gen3cCompositePipeline(diffusion_pipeline).generate(
+    scene, prompt="A red chair in a furnished room", device="cuda",
+    review_dir="outputs/composite/chair_review",
+    generation_settings={"checkpoint_revision": "your immutable checkpoint revision"},
+)
+# output is (uint8_video_THWC, final_prompt), or None if a guardrail blocks a chunk.
+```
+
+The first seed is always built from source RGB using the image-space compositor.
+There is no seed-strategy flag or rendered/provided fallback. The first camera
+must match the environment source pose and remain within its image field of
+view. Seed RGB has no spatial coverage mask; warp conditioning does carry
+binary coverage. All selected sources share one joint depth test, with each
+winning surface routed into its source buffer. Selected objects from the same
+source share that buffer. Buffers are ordered by sorted source ID, recorded as
+`conditioning_source_ids` in the
+manifest. Closer geometry occludes farther geometry across sources, including
+the environment. Hidden RGB, depth, and coverage are cleared to -1/0/0. Sources
+with no selection are omitted; empty or fully hidden selected sources retain slots.
+Source placement must establish consistent destination positions and scale;
+back-projection alone does not align unrelated scenes.
+
+The existing model independently encodes each RGB and mask buffer, concatenates
+those latents along channels, and pads unused slots with zero latents. The
+number of buffers must not exceed the checkpoint's `frame_buffer_max` (currently
+2 in the GEN3C inference configuration); generation rejects overflow rather than
+silently discarding sources or changing model capacity. Model weights and APIs
+are unchanged. This is the current code's latent concatenation strategy, not
+the paper's feature max pooling.
+
+`render_cache()` and `render_diagnostics()` return combined scene renders;
+`render_conditioning()` routes the same joint winners into separate source
+buffers. Geometric preview joint images are recombined from visible buffers without
+another projection; holes in those diagnostic images remain -1. The initial
+image seed is constructed independently from source RGB, never from these
+buffers. Rendering does not fill gaps between points.
+
+Chunks overlap by one frame. Each continuation uses the preceding generated
+frame as its seed. Source caches remain static and generated-frame cache
+updates are disabled. Video segments are concatenated once after generation.
+Persistent-server support remains deferred.
+
+## Adaptive pixel coverage
+
+The composite pipeline always projects each sample's source-pixel cell instead
+of only its center. There is no rendering-mode flag. Previews and conditioning
+share the same joint depth test, using
+ray-plane depth at each target pixel. Large valid cells are clipped to the image
+and streamed without a size-triggered fallback to points. This improves sampling
+coverage under magnification; it does not reconstruct unseen geometry.
+
+The renderer uses fixed internal defaults: batches of at most 262,144 expanded
+point–pixel candidates and a 5% relative source-depth threshold for estimating
+support from neighbors. Batching bounds temporary memory without changing
+coverage. The depth threshold helps avoid connecting foreground and background.
+Neither is a CLI flag or public renderer option. Neighbors must also be valid
+and share the same canonical label. Missing axes use a frontoparallel source-pixel
+estimate; degenerate cells or cells crossing the target near plane fall back to
+point projection. Independent cells can leave seams on curved/noisy geometry,
+and silhouette accuracy still requires real-source inspection.
+
+Use `build_composite_scene(scene)` or `Gen3cCompositePipeline.generate()` normally;
+no rendering configuration is required. Direct `Cache3D_Composite` callers
+provide `source_w2c=[4,4]` and `source_intrinsics=[3,3]` tensors in `add_source()`.
+The scene builder supplies those runtime cameras automatically. No cache,
+scene, or prepared-source artifact migration is required. `generation.json`
+records the actual renderer settings under `renderer`.
+
+For a synthetic preview without model weights:
+
+```bash
+python -m scripts.preview_composite_render \
+    --output-dir outputs/composite_adaptive_preview
+```
+
+CPU tests establish contract and synthetic geometry behavior; CUDA render time,
+peak memory, real-image silhouettes and moving-camera GEN3C quality remain
+manual acceptance checks.
+
+## Review artifacts
+
+The CLI saves `<name>.mp4` and `<name>_review/` containing:
+
+- `scene.json`: resolved scene configuration and placement matrices.
+- `generation.json`: source fingerprints, label revisions/provenance and hashes,
+  resolved selections/transforms, generation settings, code/checkpoint revision,
+  seed coverage, ordered conditioning source IDs, strategy, visibility policy,
+  depth tolerance, and completion/blocked/failure status.
+- `seed.npy` and `seed.png`: exact normalized seed `[1,3,1,H,W]` and preview.
+- `render_<start>.npz`: complete per-chunk RGB `[1,T,N,3,H,W]` in [-1,1],
+  metric camera-Z depth `[1,T,N,H,W]` and coverage `[1,T,N,1,H,W]` in {0,1}.
+- `rgb_<start>_buffer_<index>.png`, `depth_<start>_buffer_<index>.png`,
+  `coverage_<start>_buffer_<index>.png`: the first frame of each source buffer
+  in each chunk. `N` is the number of selected source caches. Depth PNGs normalize to each frame's maximum; use NPZ
+  arrays for depth measurements.
+- `prompt.txt`: final prompt on successful CLI generation.
+
+CPU contract tests use mocked diffusion. The MVP still requires manual CUDA
+validation on GCP: inspect placement scale, generated occlusion boundaries, excluded
+object leakage, seed holes, recognizability, and temporal consistency. Record
+visual failures separately from errors already visible in geometric renders.
+
+Every rank renders RGB/coverage with joint visibility; only the writer returns
+review depth. Rendering does not allocate categorical winner or nearest-depth
+diagnostics. Review depth is released before diffusion, and conditioning buffers
+before the next chunk.
+Other ranks omit review-only buffers, hashes, and files. Source provenance comes
+from the already validated label records. Preview tools retain full diagnostics.
+
+## Image-space seed
+
+Composite generation always constructs its first seed directly from source RGB.
+The former `--seed_strategy`, `--seed_image`, and `--min_seed_coverage` arguments
+have been removed from both the CLI and Python generation API. Warp RGB and
+coverage masks are unchanged; continuation chunks still use the last generated
+frame. A clean seed cannot prevent all artifacts from damaged warp conditioning.
+
+Preview the seed on CPU before loading diffusion weights:
+
+```bash
+OMP_NUM_THREADS=4 python -m scripts.preview_composite_seed \
+  --scene-spec outputs/gcp_composite_inputs/scene_121.json \
+  --output-dir outputs/seed_preview --compare-rendered
+```
+
+The first camera must match the environment's source pose, and its field of
+view must lie within the source image. RGB is sampled directly with bilinear
+interpolation and edge extension within source pixel cells. Preserve pixel
+centers when resizing intrinsics: scale each row, then add `(scale - 1) / 2`
+to that row's principal point. Deselected positive-ID environment objects are
+automatically filled using CPU LaMa before compositing; see
+[LaMa setup and exact commands](LAMA_SEED_SETUP.md). This uses a TorchScript
+checkpoint with existing dependencies, not the original LaMa training package.
+Unresolved valid labels and moved environment objects still raise an error.
+
+Each selected imported object becomes a textured source-camera plane at its
+median valid depth, transformed by its existing scene placement. This avoids
+per-pixel depth slopes and their slivers, but can change a nonplanar object's
+apparent size or position. Inspect the preview and adjust placement deliberately.
+Override a proxy depth, in source-camera units, with
+`--seed_plane_depths '{"object:1": 16.0}'` (preview: `--seed-plane-depths`).
+Unknown object keys and invalid depths are errors.
+
+Visibility compares plane camera-Z against nearest-sampled environment depth
+and other planes. Alpha edges use premultiplied RGB to avoid black fringes.
+Per-pixel depth ordering handles intersecting planes. Equal-depth object ties
+prefer sorted source ID then instance ID; environment ties use the renderer's
+absolute depth tolerance and source ordering.
+
+By default, overlaps with missing depth or local depth boundaries raise an
+error before diffusion weights load. Correct the scene/depth or explicitly use `--seed_occlusion_policy allow` (preview:
+`--seed-occlusion-policy allow`). This draws objects over missing environment
+depth and uses the available depth at uncertain boundaries; the uncertain
+regions are saved, not treated as reliable geometry.
+
+Python callers can adjust `seed_plane_depths` (a dict) and
+`seed_occlusion_policy` on `generate()`. The seed has complete RGB;
+this does not imply complete or trustworthy 3D geometry.
+
+Generation always saves:
+
+- `seed_metadata.json`: fixed image-space construction, plane depths and projected
+  bounds, explicit uncertainty policy, source fingerprints and ownership ordering.
+- `seed_diagnostics.npz`: ownership `(source index, canonical object ID)`, proxy
+  depth (zero for background), uncertainty, observed/synthesized RGB masks, and
+  environment depth validity for image-space seeds. Antialiased pixels may mix
+  multiple layers; ownership identifies the nearest contributing layer.
+- `seed_uncertainty.png` and other diagnostic masks: white marks true pixels.
+  Observed means RGB sampled from sources, not measured target-view geometry;
+  `seed_synthesized.png` identifies RGB still contributed by LaMa, while
+  `seed_background_synthesized.png` shows the repair before foreground objects
+  are pasted. Filled backgrounds are excluded from seed occlusion depth tests.
+  LaMa RGB is never added as measured geometry to source caches.
+
+The CPU preview writes these seed files and a resolved scene. Its optional
+`--compare-rendered` writes `cache_render_reference/` for visual inspection only;
+that reference can never be selected as a generation seed. Full generation
+records seed metadata and `initial_warp_coverage` in `generation.json`. Warp
+coverage is diagnostic and never determines whether seed pixels are black.
+
+LaMa runs only when removal is requested, preserves unmasked source pixels, and
+caches the repaired background for reuse. It needs no GPU or package installs.
+See [setup](LAMA_SEED_SETUP.md) for weights, masks, cache details, and the explicit
+`--seed_removal_mask` option for sources whose removal IDs were already discarded.

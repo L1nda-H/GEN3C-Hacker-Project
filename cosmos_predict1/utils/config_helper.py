@@ -23,12 +23,13 @@ from typing import Any, Dict, Optional
 
 import attr
 import attrs
-from hydra import compose, initialize
+from hydra import compose
 from hydra.core.config_store import ConfigStore
 from omegaconf import DictConfig, OmegaConf
 
 from cosmos_predict1.utils import log
 from cosmos_predict1.utils.config import Config
+from cosmos_predict1.utils.model_config import model_config_session
 
 
 def is_attrs_or_dataclass(obj) -> bool:
@@ -84,9 +85,11 @@ def override(config: Config, overrides: Optional[list[str]] = None) -> Config:
         overrides = overrides[1:]
     # Use Hydra to handle overrides
     cs = ConfigStore.instance()
-    cs.store(name="config", node=config_omegaconf)
-    with initialize(version_base=None):
-        config_omegaconf = compose(config_name="config", overrides=overrides)
+    # A shared application may already have its own root config named "config".
+    config_name = "_cosmos_predict1_runtime_config"
+    cs.store(name=config_name, node=config_omegaconf)
+    with model_config_session():
+        config_omegaconf = compose(config_name=config_name, overrides=overrides)
         OmegaConf.resolve(config_omegaconf)
 
     def config_from_dict(ref_instance: Any, kwargs: Any) -> Any:

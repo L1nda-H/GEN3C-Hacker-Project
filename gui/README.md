@@ -20,6 +20,27 @@ cd GEN3C/gui
 pip install -r ./requirements.txt
 ```
 
+If your environment was set up for the composite CLI without MoGe, install
+MoGe before starting this server. The persistent GUI backend imports
+`moge.model.v1` at startup and loads `Ruicheng/moge-vitl`, even when you plan
+to seed from prepared RGB-D data. The standalone composite CLI does not need it.
+
+Use this older MoGe revision and its matching geometry utilities to avoid the
+NumPy 2 / Gradio dependency upgrades from current MoGe. `--no-deps` preserves
+your installed GEN3C dependencies; these commands assume the existing GEN3C
+and GUI requirements have been installed. MoGe's own Gradio demo is unused.
+
+```bash
+python -m pip install --no-deps \
+  'git+https://github.com/EasternJournalist/utils3d.git@c5daf6f6c244d251f252102d09e9b7bcef791a38' \
+  'git+https://github.com/microsoft/MoGe.git@286873bdaa16fe05086ac2e081d6bc87b7523118'
+python -c 'from moge.model.v1 import MoGeModel; print("MoGe import OK")'
+```
+
+This revision's [model entry point](https://github.com/microsoft/MoGe/blob/286873bdaa16fe05086ac2e081d6bc87b7523118/moge/model/v1.py)
+matches the server import. The import check does not load weights or validate
+GPU inference; the first server start also downloads MoGe weights if uncached.
+
 Finally, start the inference server while optionally setting some parameters via `GEN3C_*` environment variables:
 
 ```bash

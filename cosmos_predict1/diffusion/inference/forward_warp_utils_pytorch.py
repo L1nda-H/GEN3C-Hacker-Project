@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from typing import Optional, Tuple
+import math
 import numpy as np
 import torch
 import os
@@ -486,133 +487,197 @@ def project_points(world_points: torch.Tensor, w2c: torch.Tensor, intrinsic: tor
         return projected_points
 
 
-def _is_moving_against_neighbor(
-    depth_src: torch.Tensor,
-    w2c_src: torch.Tensor,
-    intrinsic_src: torch.Tensor,
-    depth_dst: torch.Tensor,
-    w2c_dst: torch.Tensor,
-    intrinsic_dst: torch.Tensor,
-    rel_thresh: float,
-) -> torch.Tensor:
-    """Return 1 where one neighbor shows that the source pixel moved.
+def _point_pixel_coordinates(camera, projected, image_size):
+    """Shared pixel bounds/rounding for point samples and degenerate cells."""
+    height, width = image_size
+    uv = projected[..., :2] / camera[..., 2:3]
+    valid = (torch.isfinite(camera).all(-1) & torch.isfinite(uv).all(-1) & (camera[..., 2] > 0)
+             & (uv[..., 0] >= -.5) & (uv[..., 0] < width - .5)
+             & (uv[..., 1] >= -.5) & (uv[..., 1] < height - .5))
+    # Invalid coordinates are never emitted; bound them before integer conversion.
+    xy = torch.floor(uv.nan_to_num().clamp(-1, max(height, width)) + .5).long()
+    return xy, valid
 
-    The neighbor sample is the depth at the nearest pixel of the projected
-    world point. The pixel stays 0 when that landing is outside the neighbor,
-    when the neighbor depth there is invalid, or when the neighbor surface is
-    closer than the source point (the point is hidden, not moving).
+
+def _surface_winners(candidates, point_count, shape, device, depth_tolerance):
+    """Reduce replayable candidate batches with one deterministic visibility policy.
+
+    The factory yields (flat pixel, camera-Z, point rank). Replaying it avoids
+    retaining expanded candidates: first find true minimum depth, then choose
+    the smallest rank within tolerance. Both point and pixel-cell paths use this.
     """
-    frames, _, height, width = depth_src.shape
-    world_src = unproject_points(depth_src, w2c_src, intrinsic_src, is_depth=True)
-    projected = project_points(world_src, w2c_dst, intrinsic_dst)
-    z_dst = projected[..., 2, 0]
-    pixel_dst = projected[..., :2, 0] / z_dst.unsqueeze(-1).clamp_min(1e-8)
-
-    nearest_u = torch.round(pixel_dst[..., 0])
-    nearest_v = torch.round(pixel_dst[..., 1])
-    source_depth = depth_src[:, 0]
-    inside = (
-        (z_dst > 0)
-        & torch.isfinite(z_dst)
-        & torch.isfinite(pixel_dst).all(dim=-1)
-        & (nearest_u >= 0)
-        & (nearest_u <= width - 1)
-        & (nearest_v >= 0)
-        & (nearest_v <= height - 1)
-        & (source_depth > 0)
-        & torch.isfinite(source_depth)
-    )
-    u_idx = nearest_u.clamp(0, width - 1).long()
-    v_idx = nearest_v.clamp(0, height - 1).long()
-    batch_idx = torch.arange(frames, device=depth_src.device)[:, None, None]
-
-    neighbor_depth = depth_dst[:, 0][batch_idx, v_idx, u_idx]
-    observed = inside & (neighbor_depth > 0) & torch.isfinite(neighbor_depth)
-    # One-sided: the source point is in front of the neighbor surface. A nearer
-    # neighbor surface is an occluder, and that pixel was not observed to move.
-    forward_fail = (neighbor_depth - z_dst) / neighbor_depth.clamp_min(1e-8) > rel_thresh
-
-    world_dst = unproject_points(depth_dst, w2c_dst, intrinsic_dst, is_depth=True)
-    landed = world_dst[batch_idx, v_idx, u_idx]
-    projected_back = project_points(landed, w2c_src, intrinsic_src)
-    z_back = projected_back[..., 2, 0]
-    pixel_back = projected_back[..., :2, 0] / z_back.unsqueeze(-1).clamp_min(1e-8)
-    source_u = torch.arange(width, device=depth_src.device, dtype=depth_src.dtype).view(1, 1, width)
-    source_v = torch.arange(height, device=depth_src.device, dtype=depth_src.dtype).view(1, height, 1)
-    miss = (z_back <= 0) | ~torch.isfinite(z_back) | ~torch.isfinite(pixel_back).all(dim=-1)
-    miss = miss | ((pixel_back[..., 0] - source_u).square() + (pixel_back[..., 1] - source_v).square() > 1)
-    back_depth_fail = (z_back - source_depth).abs() / source_depth.clamp_min(1e-8) > rel_thresh
-    moving = observed & forward_fail & (miss | back_depth_fail)
-    return moving.to(dtype=depth_src.dtype)
+    nearest = torch.full((math.prod(shape),), float('inf'), device=device, dtype=torch.float32)
+    winners = torch.full_like(nearest, point_count, dtype=torch.int64)
+    for pixel, z, _ in candidates():
+        nearest.scatter_reduce_(0, pixel, z, reduce='amin', include_self=True)
+    for pixel, z, rank in candidates():
+        eligible = (z - nearest[pixel]) <= depth_tolerance
+        winners.scatter_reduce_(0, pixel[eligible], rank[eligible], reduce='amin', include_self=True)
+    holes = winners == point_count
+    winners[holes] = -1
+    nearest[holes] = 0
+    return winners.reshape(shape), nearest.reshape(shape)
 
 
-def motion_label(
-    depth: torch.Tensor,
-    w2c: torch.Tensor,
-    intrinsics: torch.Tensor,
-    rel_thresh: float,
-) -> torch.Tensor:
-    """Label pixels that fail a cross-frame depth check.
+@torch.no_grad()
+def nearest_surface_winners(points, w2cs, intrinsics, image_size, *, depth_tolerance=0., point_chunk_size=65536):
+    """Joint z-buffer for ordered CPU [K,3] points and [T,...] cameras.
 
-    For pixel (u, v) in frame f, unproject a world point and project it into
-    frame f-1 and frame f+1. The first and last frames use their one neighbor.
-    The neighbor depth is the value stored at the nearest landed pixel.
-
-    The pixel is marked 1 when either in-bounds neighbor satisfies both checks:
-    the source point is closer than that neighbor surface,
-    ``(d_neighbor - z') / d_neighbor > rel_thresh``, and the neighbor pixel
-    unprojected and projected back misses (u, v) by more than one pixel or
-    fails ``|z_back - d_source| / d_source > rel_thresh``. A nearer neighbor
-    surface hides the point, so that pixel stays 0.
-
-    Args:
-        depth: (F, 1, H, W) depth maps, or (B, F, 1, H, W) independent sequences.
-        w2c: (F, 4, 4) or (B, F, 4, 4) world-to-camera matrices.
-        intrinsics: (F, 3, 3) or (B, F, 3, 3) camera intrinsics.
-        rel_thresh: relative depth change above which a check fails.
-
-    Returns:
-        Float tensor with the same shape as ``depth``. Pixels with no positive
-        depth, and pixels whose projections land outside every neighbor, stay 0.
-        A leading batch compares neighbors only inside each sequence.
+    Return [T,H,W] point indices (-1 for holes) and nearest camera-Z (0 for
+    holes). Indices encode caller-supplied tie priority. Candidates within an
+    absolute tolerance of the true minimum compete by smallest index, without
+    averaging. Two passes avoid tolerance chains and chunk-order dependence.
+    Pixels use floor(uv + .5), with half-open bounds [-.5, size-.5).
+    Projection work is bounded by T * point_chunk_size; points stay on CPU.
+    Camera validation and frame chunking belong to the caller.
     """
-    single_sequence = depth.dim() == 4
-    if single_sequence:
-        depth = depth.unsqueeze(0)
-        w2c = w2c.unsqueeze(0)
-        intrinsics = intrinsics.unsqueeze(0)
-    if depth.dim() != 5 or depth.shape[2] != 1:
-        raise ValueError(
-            f"depth must have shape (F, 1, H, W) or (B, F, 1, H, W), got {tuple(depth.shape)}"
+    height, width = image_size
+    frames = len(w2cs)
+
+    def candidates():
+        for start in range(0, len(points), point_chunk_size):
+            chunk = points[start:start + point_chunk_size].to(device=w2cs.device, dtype=torch.float32)
+            projected, camera = project_points(
+                chunk[None, None].expand(frames, 1, -1, -1), w2cs, intrinsics, return_cam_points=True,
+            )
+            xy, valid = _point_pixel_coordinates(camera[:, 0], projected[:, 0, :, :, 0], image_size)
+            frame, point = torch.nonzero(valid, as_tuple=True)
+            xy = xy[frame, point]
+            pixel = frame * (height * width) + xy[:, 1] * width + xy[:, 0]
+            yield pixel, camera[frame, 0, point, 2], point + start
+
+    with torch.autocast(device_type=w2cs.device.type, enabled=False):
+        return _surface_winners(candidates, len(points), (frames, height, width), w2cs.device, depth_tolerance)
+
+
+def _camera_pixel_cells(points, tangents, w2cs, intrinsics):
+    """Project planar pixel cells; leading dimensions broadcast (float32).
+
+    Tangents are full source-pixel steps [...,2,3]. Zero/parallel tangents and
+    cells crossing the near plane use the legacy center-point contribution.
+    """
+    rotation = w2cs[..., :3, :3]
+    center = (rotation @ points[..., None])[..., 0] + w2cs[..., :3, 3]
+    axes = tangents @ rotation.transpose(-1, -2)
+    lengths = torch.linalg.vector_norm(axes, dim=-1)
+    unit = axes / lengths.clamp_min(1e-20)[..., None]
+    normal = torch.linalg.cross(unit[..., 0, :], unit[..., 1, :])
+    sine = torch.linalg.vector_norm(normal, dim=-1)
+    normal = normal / sine.clamp_min(1e-20)[..., None]
+    dual_u = torch.linalg.cross(unit[..., 1, :], normal)
+    dual_v = torch.linalg.cross(normal, unit[..., 0, :])
+    dual_u = dual_u / (dual_u * axes[..., 0, :]).sum(-1).clamp_min(1e-20)[..., None]
+    dual_v = dual_v / (dual_v * axes[..., 1, :]).sum(-1).clamp_min(1e-20)[..., None]
+    signs = points.new_tensor([[-.5, -.5], [.5, -.5], [.5, .5], [-.5, .5]])
+    corners = center[..., None, :] + signs @ axes
+    projected = corners @ intrinsics.transpose(-1, -2)
+    uv = projected[..., :2] / corners[..., 2:3]
+    usable = ((lengths > 1e-20).all(-1) & (sine > 1e-5)
+              & torch.isfinite(corners).all(dim=(-1, -2))
+              & (corners[..., 2] > 1e-6).all(-1)
+              & torch.isfinite(uv).all(dim=(-1, -2)))
+    return center, normal, dual_u, dual_v, uv, usable
+
+
+def _pixel_cell_rays(xy, intrinsics):
+    # OpenCV upper-triangular intrinsics, including skew; ray camera-Z is 1.
+    y = (xy[..., 1] - intrinsics[..., 1, 2]) / intrinsics[..., 1, 1]
+    x = (xy[..., 0] - intrinsics[..., 0, 2] - intrinsics[..., 0, 1] * y) / intrinsics[..., 0, 0]
+    return torch.stack((x, y, torch.ones_like(x)), dim=-1)
+
+
+def _pixel_cell_intersection(center, normal, rays):
+    denominator = (normal * rays).sum(-1)
+    depth = (normal * center).sum(-1) / denominator
+    valid = (denominator.abs() > 1e-7 * torch.linalg.vector_norm(rays, dim=-1))
+    return depth, valid & torch.isfinite(depth) & (depth > 0)
+
+
+def pixel_cell_winner_depth(points, tangents, w2cs, intrinsics, xy):
+    """Reconstruct selected candidate camera-Z, preserving point fallbacks/ties."""
+    center, normal, _, _, _, usable = _camera_pixel_cells(points, tangents, w2cs, intrinsics)
+    depth, _ = _pixel_cell_intersection(center, normal, _pixel_cell_rays(xy, intrinsics))
+    return torch.where(usable, depth, center[..., 2])
+
+
+def _adaptive_surface_candidates(points, tangents, w2cs, intrinsics, image_size,
+                                 point_chunk_size, candidate_batch_size):
+    """Yield bounded (flat pixel, camera-Z, point rank) batches.
+
+    Bounding-box pixels are batched *before* polygon rejection. Even one cell
+    covering the entire image is streamed; its extent never triggers fallback.
+    Projection storage is bounded separately by frames * point_chunk_size.
+    """
+    height, width = image_size
+    device = w2cs.device
+    for start in range(0, len(points), point_chunk_size):
+        chunk = points[start:start + point_chunk_size].to(device=device, dtype=torch.float32)
+        axes = tangents[start:start + point_chunk_size].to(device=device, dtype=torch.float32)
+        center, normal, dual_u, dual_v, quad, usable = _camera_pixel_cells(
+            chunk[None], axes[None], w2cs[:, None], intrinsics[:, None],
         )
-    batch, frames, _, height, width = depth.shape
-    if w2c.shape != (batch, frames, 4, 4):
-        raise ValueError(f"w2c must have shape {(batch, frames, 4, 4)}, got {tuple(w2c.shape)}")
-    if intrinsics.shape != (batch, frames, 3, 3):
-        raise ValueError(
-            f"intrinsics must have shape {(batch, frames, 3, 3)}, got {tuple(intrinsics.shape)}"
+        # Clip in floating point before integer conversion (also handles huge
+        # but finite projections). Empty offscreen boxes have zero area.
+        lower = torch.ceil(quad.amin(-2)).nan_to_num().clamp_min(0)
+        upper = torch.floor(quad.amax(-2)).nan_to_num().clamp_min(-1)
+        limit = chunk.new_tensor([width, height])
+        lower = torch.minimum(lower, limit).long()
+        upper = torch.minimum(upper, limit - 1).long()
+        projected = (intrinsics[:, None] @ center[..., None])[..., 0]
+        rounded, point_valid = _point_pixel_coordinates(center, projected, image_size)
+        lower = torch.where(usable[..., None], lower, rounded)
+        upper = torch.where(usable[..., None], upper, rounded)
+        extent = (upper - lower + 1).clamp_min(0)
+        counts = extent.prod(-1)
+        counts = torch.where(usable | point_valid, counts, 0).reshape(-1)
+        ends = counts.cumsum(0)
+        total = int(ends[-1])
+        lower, extent = lower.reshape(-1, 2), extent.reshape(-1, 2)
+        center, normal = center.reshape(-1, 3), normal.reshape(-1, 3)
+        dual_u, dual_v = dual_u.reshape(-1, 3), dual_v.reshape(-1, 3)
+        usable = usable.reshape(-1)
+        for offset in range(0, total, candidate_batch_size):
+            linear = torch.arange(offset, min(offset + candidate_batch_size, total), device=device)
+            cell = torch.searchsorted(ends, linear, right=True)
+            local = linear - (ends[cell] - counts[cell])
+            box_width = extent[cell, 0]
+            xy = lower[cell] + torch.stack((local % box_width, local // box_width), -1)
+            frame = cell // len(chunk)
+            rays = _pixel_cell_rays(xy.float(), intrinsics[frame])
+            z, valid = _pixel_cell_intersection(center[cell], normal[cell], rays)
+            delta = rays * z[:, None] - center[cell]
+            coordinates = torch.stack(((delta * dual_u[cell]).sum(-1),
+                                       (delta * dual_v[cell]).sum(-1)), -1)
+            # Snap numerical noise at shared edges, then use [-.5,.5) in
+            # source-cell coordinates. This also works for back-facing cells.
+            coordinates = torch.where((coordinates.abs() - .5).abs() < 1e-5,
+                                      coordinates.sign() * .5, coordinates)
+            inside = valid & (coordinates >= -.5).all(-1) & (coordinates < .5).all(-1)
+            accept = ~usable[cell] | inside
+            z = torch.where(usable[cell], z, center[cell, 2])
+            pixel = frame * (height * width) + xy[:, 1] * width + xy[:, 0]
+            yield pixel[accept], z[accept], (cell % len(chunk) + start)[accept]
+
+
+@torch.no_grad()
+def adaptive_surface_winners(points, tangents, w2cs, intrinsics, image_size, *, depth_tolerance=0.,
+                             point_chunk_size=65536, candidate_batch_size=262144):
+    """Hard joint visibility for projected planar source-pixel cells.
+
+    Return the same winner/minimum-depth contract as nearest_surface_winners.
+    Candidate depth uses the plane at the target pixel, not the point center.
+    The two passes preserve categorical tie priority without tolerance chains.
+    """
+    if type(candidate_batch_size) is not int or candidate_batch_size <= 0:
+        raise ValueError("Candidate batch size must be a positive integer")
+
+    def candidates():
+        return _adaptive_surface_candidates(
+            points, tangents, w2cs, intrinsics, image_size, point_chunk_size, candidate_batch_size,
         )
 
-    label = torch.zeros_like(depth)
-    if frames < 2:
-        return label[0] if single_sequence else label
-
-    pairs = batch * (frames - 1)
-    src_depth = depth[:, :-1].reshape(pairs, 1, height, width)
-    dst_depth = depth[:, 1:].reshape(pairs, 1, height, width)
-    src_w2c = w2c[:, :-1].reshape(pairs, 4, 4)
-    dst_w2c = w2c[:, 1:].reshape(pairs, 4, 4)
-    src_intrinsics = intrinsics[:, :-1].reshape(pairs, 3, 3)
-    dst_intrinsics = intrinsics[:, 1:].reshape(pairs, 3, 3)
-    against_next = _is_moving_against_neighbor(
-        src_depth, src_w2c, src_intrinsics, dst_depth, dst_w2c, dst_intrinsics, rel_thresh
-    ).reshape(batch, frames - 1, height, width)
-    against_prev = _is_moving_against_neighbor(
-        dst_depth, dst_w2c, dst_intrinsics, src_depth, src_w2c, src_intrinsics, rel_thresh
-    ).reshape(batch, frames - 1, height, width)
-    label[:, :-1, 0] = torch.maximum(label[:, :-1, 0], against_next)
-    label[:, 1:, 0] = torch.maximum(label[:, 1:, 0], against_prev)
-    return label[0] if single_sequence else label
+    with torch.autocast(device_type=w2cs.device.type, enabled=False):
+        return _surface_winners(candidates, len(points), (len(w2cs), *image_size), w2cs.device, depth_tolerance)
 
 
 def unproject_depth_torch(
